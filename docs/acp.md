@@ -215,13 +215,15 @@ text/image tool results.
   A cancelled select posts an independent `omp_permission` call/result pair only
   with `Emit.TOOL_CALLS`. Offered selections stay silent; option labels do not
   determine an SDK denial outcome. Permission narration records no turn effect
-  or chat reply. Tool arguments embedded in a title share native-event
-  normalization and redaction, including `mcp__` names and executed `xd://`
-  device writes. Bare Band aliases use the canonical tool's privacy policy
-  without relabelling native events. Unparseable arguments are replaced by a
-  fixed placeholder. Synthetic IDs use `band-permission:`; metadata retains the original
-  `omp_request_id`. Native tool events and their IDs are never changed or merged
-  with permission records.
+  or chat reply. Permission titles and native events share full-registry privacy
+  redaction, including `mcp__` names and executed `xd://` device writes. Bare Band
+  aliases use the canonical privacy policy without relabelling native events.
+  Native names and turn effects still use enabled capabilities plus contacts;
+  withheld device writes retain their path, other fields and string payload.
+  Unparseable arguments, including decoder integer-limit errors, use a fixed
+  placeholder. Synthetic IDs use `band-permission:`; metadata retains the
+  original `omp_request_id`. Native event IDs are never changed or merged with
+  permission records.
 
 ## Server prompt outcomes
 

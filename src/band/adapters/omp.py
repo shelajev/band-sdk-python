@@ -566,26 +566,55 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
             )
 
     def _project_tool_call(
-        self, tool_name: str, arguments: dict[str, JsonValue]
+        self,
+        tool_name: str,
+        arguments: dict[str, JsonValue],
+        *,
+        preserve_native_semantics: bool = False,
     ) -> tuple[str, dict[str, JsonValue]]:
-        # Withheld tools still need privacy protection; this does not advertise
-        # them or change which calls the adapter allows.
+        kind = "execute" if tool_name == "write" else "read"
+        native_name, native_arguments = tool_name, arguments
+        if preserve_native_semantics:
+            enabled = frozenset(
+                item.name
+                for item in iter_tool_definitions(
+                    capabilities=self.features.capabilities | {Capability.CONTACTS}
+                )
+            )
+            native_name, normalized = normalize_omp_mcp_device_call(
+                tool_name, arguments, enabled, kind=kind
+            )
+            native_arguments = cast(dict[str, JsonValue], normalized)
         names = frozenset(
             item.name
             for item in iter_tool_definitions(capabilities=frozenset(Capability))
         )
-        name, normalized = normalize_omp_mcp_device_call(
-            tool_name,
-            arguments,
-            names,
-            kind="execute" if tool_name == "write" else "read",
-        )
+        try:
+            name, normalized = normalize_omp_mcp_device_call(
+                tool_name, arguments, names, kind=kind
+            )
+        except ValueError:
+            if not preserve_native_semantics:
+                raise
+            # A privacy-only decode must not change a withheld native event.
+            # Recognize the device without parsing its content, then redact it.
+            name, _ = normalize_omp_mcp_device_call(
+                tool_name, {**arguments, "content": None}, names, kind=kind
+            )
+            normalized = arguments
         # Bare Band aliases need the same privacy policy, without relabelling
         # native events or treating another server's tool as a Band tool.
         redaction_name = f"band_{name}" if f"band_{name}" in names else name
-        return name, redact_tool_call_args(
-            redaction_name, cast(dict[str, JsonValue], normalized)
-        )
+        privacy_arguments = cast(dict[str, JsonValue], normalized)
+        redacted = redact_tool_call_args(redaction_name, privacy_arguments)
+        if not preserve_native_semantics:
+            return name, redacted
+        if native_name == name or privacy_arguments == arguments:
+            return native_name, redacted
+        if redacted == privacy_arguments:
+            return native_name, native_arguments
+        # Keep the withheld device's path, other fields and string payload.
+        return native_name, {**native_arguments, "content": json.dumps(redacted)}
 
     def _permission_arguments(self, title: str) -> dict[str, JsonValue]:
         """Project a UI title through the native tool normalization owner."""
@@ -604,7 +633,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                             "tool_name": name,
                             "arguments": projected,
                         }
-                except (json.JSONDecodeError, RecursionError, UnicodeError):
+                except (ValueError, RecursionError):
                     pass
         return {"message": f"{header}Arguments: [arguments unavailable]"}
 
@@ -700,7 +729,9 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 if not event.toolCallId or not event.toolName:
                     return
                 args = event.args if isinstance(event.args, dict) else {}
-                name, arguments = self._project_tool_call(event.toolName, args)
+                name, arguments = self._project_tool_call(
+                    event.toolName, args, preserve_native_semantics=True
+                )
                 turn.calls[event.toolCallId] = (name, arguments)
                 if Emit.TOOL_CALLS in self.features.emit:
                     await send_event_safe(

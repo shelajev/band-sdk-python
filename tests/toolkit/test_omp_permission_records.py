@@ -26,11 +26,27 @@ async def _cancel(_request) -> None:
     return None
 
 
-async def owned_rpc_turn(monkeypatch, tmp_path: Path, title: str, order: str):
+async def owned_rpc_turn(
+    monkeypatch,
+    tmp_path: Path,
+    title: str,
+    order: str,
+    *,
+    native_name: str = "read",
+    native_arguments=None,
+    native_error: bool = True,
+    inject_band_tools: bool = True,
+    child_receipts=None,
+):
     observed = []
-    clients = []
+    processes = []
 
     class OrderingClient(OmpRpcClient):
+        async def start(self):
+            await super().start()
+            assert self._proc is not None
+            processes.append(self._proc)
+
         async def prompt(self, message, *, on_event, on_tool, on_ui):
             async def event(frame):
                 if frame.type in {"tool_execution_start", "tool_execution_end"}:
@@ -61,15 +77,22 @@ async def owned_rpc_turn(monkeypatch, tmp_path: Path, title: str, order: str):
                 **(env or {}),
                 "PYTHONPATH": str(Path(__file__).parent.parent.parent),
                 "OMP_TEST_PERMISSION_TITLE": title,
+                "OMP_TEST_NATIVE_NAME": native_name,
+                "OMP_TEST_NATIVE_ARGUMENTS": json.dumps(
+                    {"path": "denied.txt"}
+                    if native_arguments is None
+                    else native_arguments
+                ),
+                "OMP_TEST_NATIVE_ERROR": "1" if native_error else "0",
             },
         )
-        clients.append(client)
         return client
 
     monkeypatch.setattr("band.adapters.omp.OmpRpcClient", client_factory)
     monkeypatch.setattr("band.adapters.omp.omp_mcp_ready", _ready)
     adapter = OmpAdapter(
-        OmpAdapterConfig(cwd=str(tmp_path)), resolve_permission=_cancel
+        OmpAdapterConfig(cwd=str(tmp_path), inject_band_tools=inject_band_tools),
+        resolve_permission=_cancel,
     )
     tools = FakeAgentTools()
     try:
@@ -84,8 +107,13 @@ async def owned_rpc_turn(monkeypatch, tmp_path: Path, title: str, order: str):
         )
     finally:
         await adapter.cleanup_all()
-    for client in clients:
-        assert client._proc is None or client._proc.returncode is not None
+    assert processes
+    for process in processes:
+        assert process.returncode is not None
+        if child_receipts is not None:
+            child_receipts.append(
+                {"pid": process.pid, "returncode": process.returncode}
+            )
     assert adapter._rooms == {}
     return tools, observed
 
@@ -261,5 +289,114 @@ async def test_owned_permission_projection_drops_unparseable_arguments(
     assert secret not in json.dumps(permission)
     assert set(permission["args"]) == {"message"}
     assert permission["args"]["message"] != title
+    assert not tools.turn.complete
+    assert tools.chat == []
+
+
+@pytest.mark.parametrize(
+    ("native_name", "device"),
+    [
+        ("mcp__band_create_task", None),
+        ("mcp__band_send_room_file", None),
+        ("write", "object"),
+        ("write", "oversized"),
+    ],
+)
+async def test_default_capabilities_preserve_native_name_and_turn_effect(
+    monkeypatch, tmp_path: Path, native_name: str, device: str | None
+) -> None:
+    secret = "withheld-file-bytes"
+    payload = {"filename": "private.txt", "content": secret, "mentions": ["user"]}
+    match native_name:
+        case "write":
+            encoded = (
+                '{"content":' + json.dumps(secret) + ',"count":' + "9" * 5000 + "}"
+                if device == "oversized"
+                else json.dumps(payload)
+            )
+            arguments = {
+                "path": "xd://mcp__band_send_room_file",
+                "content": encoded,
+                "append": False,
+            }
+        case "mcp__band_send_room_file":
+            arguments = payload
+        case _:
+            arguments = {"subject": "New work"}
+    limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    try:
+        tools, _ = await owned_rpc_turn(
+            monkeypatch,
+            tmp_path,
+            "A question",
+            "permission-first",
+            native_name=native_name,
+            native_arguments=arguments,
+            native_error=False,
+            inject_band_tools=False,
+        )
+    finally:
+        sys.set_int_max_str_digits(limit)
+    calls = [
+        json.loads(event["content"])
+        for event in events_of_type(tools, "tool_call")
+        if json.loads(event["content"])["name"] != "omp_permission"
+    ]
+    results = [
+        json.loads(event["content"])
+        for event in events_of_type(tools, "tool_result")
+        if json.loads(event["content"])["name"] != "omp_permission"
+    ]
+    assert [call["name"] for call in calls] == [native_name]
+    assert [result["name"] for result in results] == [native_name]
+    assert calls[0]["tool_call_id"] == results[0]["tool_call_id"] == "ui-wire-id"
+    projected = calls[0]["args"]
+    assert set(projected) == set(arguments)
+    if device:
+        assert projected["path"] == arguments["path"]
+        assert projected["append"] is False
+        assert isinstance(projected["content"], str)
+        if device == "object":
+            assert json.loads(projected["content"])["filename"] == "private.txt"
+            assert json.loads(projected["content"])["mentions"] == ["user"]
+    elif native_name == "mcp__band_send_room_file":
+        assert projected["filename"] == "private.txt"
+        assert projected["mentions"] == ["user"]
+    else:
+        assert projected == arguments
+    assert secret not in json.dumps(calls)
+    assert not tools.turn.complete
+    assert tools.chat == []
+
+
+async def test_oversized_permission_integer_uses_placeholder(
+    monkeypatch, tmp_path: Path
+) -> None:
+    secret = "oversized-decoder-file-bytes"
+    title = (
+        'Allow tool: band_send_room_file\nArguments: {"content":'
+        + json.dumps(secret)
+        + ',"count":'
+        + "9" * 5000
+        + "}"
+    )
+    limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    try:
+        tools, _ = await owned_rpc_turn(
+            monkeypatch, tmp_path, title, "permission-first"
+        )
+    finally:
+        sys.set_int_max_str_digits(limit)
+    permission = next(
+        json.loads(event["content"])
+        for event in events_of_type(tools, "tool_call")
+        if json.loads(event["content"])["name"] == "omp_permission"
+    )
+    assert set(permission["args"]) == {"message"}
+    assert secret not in json.dumps(permission)
+    assert "9" * 5000 not in json.dumps(permission)
+    assert len(events_of_type(tools, "tool_result")) == 2
     assert not tools.turn.complete
     assert tools.chat == []

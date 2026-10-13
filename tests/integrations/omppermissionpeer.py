@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -19,8 +20,10 @@ class PermissionPeer(Peer):
             {
                 "type": "tool_execution_start",
                 "toolCallId": "ui-wire-id",
-                "toolName": "read",
-                "args": {"path": "denied.txt"},
+                "toolName": os.environ.get("OMP_TEST_NATIVE_NAME", "read"),
+                "args": json.loads(
+                    os.environ.get("OMP_TEST_NATIVE_ARGUMENTS", '{"path":"denied.txt"}')
+                ),
             }
         )
 
@@ -30,9 +33,20 @@ class PermissionPeer(Peer):
             {
                 "type": "tool_execution_end",
                 "toolCallId": "ui-wire-id",
-                "toolName": "read",
-                "isError": True,
-                "result": {"content": [{"type": "text", "text": "Native tool failed"}]},
+                "toolName": os.environ.get("OMP_TEST_NATIVE_NAME", "read"),
+                "isError": os.environ.get("OMP_TEST_NATIVE_ERROR", "1") == "1",
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Native tool failed"
+                                if os.environ.get("OMP_TEST_NATIVE_ERROR", "1") == "1"
+                                else "Native tool finished"
+                            ),
+                        }
+                    ]
+                },
             }
         )
 
