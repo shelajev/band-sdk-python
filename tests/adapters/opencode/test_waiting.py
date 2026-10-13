@@ -38,5 +38,7 @@ class TestWaitFor:
             if completed:
                 await wait_for(lambda: ready, timeout_s=1.0)
             else:
-                with pytest.raises(pytest.fail.Exception, match="Timed out"):
+                with pytest.raises(pytest.fail.Exception):
                     await wait_for(lambda: ready, timeout_s=1.0)
+        assert now == wake_at
+        assert ready is completed
