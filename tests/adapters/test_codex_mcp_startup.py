@@ -183,7 +183,7 @@ async def test_held_resolver_does_not_block_another_room(tmp_path: Path) -> None
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def resolve(workspace: str) -> Mapping[str, CodexMcpServer]:
-        if workspace.endswith("/a"):
+        if Path(workspace).name == "a":
             entered.set()
             await release.wait()
         return await private_servers(workspace)
@@ -191,11 +191,17 @@ async def test_held_resolver_does_not_block_another_room(tmp_path: Path) -> None
     adapter, launches = mcp_adapter(tmp_path, [StatusClient(), StatusClient()], resolve)
     waiting = asyncio.create_task(start(adapter, "a"))
     try:
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), timeout=1)
         await asyncio.wait_for(start(adapter, "b"), timeout=1)
         assert adapter._room_clients["b"].initialized
         assert not adapter._room_clients["a"].initialized
+        assert adapter._room_clients["a"].client is None
+        assert not waiting.done()
         assert len(launches) == 1
+        release.set()
+        await asyncio.wait_for(waiting, timeout=1)
+        assert adapter._room_clients["a"].initialized
+        assert len(launches) == 2
     finally:
         release.set()
         await waiting
