@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
 
+import psutil
 import pytest
 
 from band.adapters.omp import OmpAdapter, OmpAdapterConfig
@@ -16,6 +18,7 @@ from band.testing import FakeAgentTools
 from band.testing.fake_tools import events_of_type
 from tests.adapters.test_omp_adapter import PendingRuntime
 from tests.integrations.acp.conftest import make_platform_message
+from tests.integrations.test_omprpc import process_is_alive
 
 
 async def _ready(*_args, **_kwargs) -> None:
@@ -36,16 +39,24 @@ async def owned_rpc_turn(
     native_arguments=None,
     native_error: bool = True,
     inject_band_tools: bool = True,
-    child_receipts=None,
 ):
     observed = []
-    processes = []
+    clients = []
 
     class OrderingClient(OmpRpcClient):
         async def start(self):
             await super().start()
             assert self._proc is not None
-            processes.append(self._proc)
+            assert self._process_identity is not None
+            checkpoint = await self.request("checkpoint")
+            peer_pid = checkpoint["pid"]
+            assert isinstance(peer_pid, int)
+            peer_identity = await asyncio.to_thread(psutil.Process, peer_pid)
+            await asyncio.to_thread(peer_identity.create_time)
+            assert peer_identity == self._process_identity or self._process_identity in (
+                await asyncio.to_thread(peer_identity.parents)
+            )
+            clients.append((self, peer_identity))
 
         async def prompt(self, message, *, on_event, on_tool, on_ui):
             async def event(frame):
@@ -107,13 +118,28 @@ async def owned_rpc_turn(
         )
     finally:
         await adapter.cleanup_all()
-    assert processes
-    for process in processes:
+    assert clients
+    for client, peer_identity in clients:
+        process = client._proc
+        assert process is not None
         assert process.returncode is not None
-        if child_receipts is not None:
-            child_receipts.append(
-                {"pid": process.pid, "returncode": process.returncode}
-            )
+        assert await process.wait() == process.returncode
+        closing = client._close_task
+        assert closing is not None and closing.done() and not closing.cancelled()
+        assert closing.exception() is None
+        assert client._process_identity is not None
+        assert (
+            peer_identity == client._process_identity
+            or peer_identity in client._descendants
+        )
+        # Windows venv launchers can expose the interpreter as a descendant.
+        # Cleanup guarantees settlement, not a zero status after forced termination.
+        for identity in {
+            client._process_identity,
+            peer_identity,
+            *client._descendants,
+        }:
+            assert not await asyncio.to_thread(process_is_alive, identity)
     assert adapter._rooms == {}
     return tools, observed
 
@@ -438,7 +464,6 @@ async def test_adversarial_projection_preserves_record_identity(
         if path == "permission"
         else "A question"
     )
-    receipts = []
     limit = sys.get_int_max_str_digits()
     sys.set_int_max_str_digits(4300)
     try:
@@ -450,7 +475,6 @@ async def test_adversarial_projection_preserves_record_identity(
             native_name="read" if path == "permission" else "write",
             native_arguments=None if path == "permission" else device,
             inject_band_tools=False,
-            child_receipts=receipts,
         )
     finally:
         sys.set_int_max_str_digits(limit)
@@ -509,7 +533,6 @@ async def test_adversarial_projection_preserves_record_identity(
     assert all(result["is_error"] for result in results)
     assert not tools.turn.complete
     assert tools.chat == []
-    assert receipts and all(receipt["returncode"] == 0 for receipt in receipts)
 
 
 @pytest.mark.parametrize("path", ["native", "permission"])
@@ -537,7 +560,6 @@ async def test_final_encode_failure_preserves_record_and_native_effect(
         return dumps(value, *args, **kwargs)
 
     monkeypatch.setattr(json, "dumps", fail_private_envelope)
-    receipts = []
     tools, _ = await owned_rpc_turn(
         monkeypatch,
         tmp_path,
@@ -554,7 +576,6 @@ async def test_final_encode_failure_preserves_record_and_native_effect(
         else None,
         native_error=False,
         inject_band_tools=False,
-        child_receipts=receipts,
     )
     calls = [
         json.loads(event["content"]) for event in events_of_type(tools, "tool_call")
@@ -577,24 +598,66 @@ async def test_final_encode_failure_preserves_record_and_native_effect(
     assert native["tool_call_id"] == "ui-wire-id"
     assert tools.turn.complete is (path == "native")
     assert tools.chat == []
-    assert receipts and all(receipt["returncode"] == 0 for receipt in receipts)
 
 
 @pytest.mark.parametrize("path", ["native", "permission"])
 async def test_decoded_depth_fails_final_encode_without_losing_record(
     monkeypatch, tmp_path: Path, path: str
 ) -> None:
-    # The C decoder/encoder limit depends on the surrounding Python stack.
-    # Sweep its boundary; injected cases above remain the deterministic proof.
-    for depth in range(9950, 10000):
-        encoded = (
+    target_name = "band_no_reply" if path == "native" else "omp_permission"
+    encoded = ""
+    decoder_limits = []
+    calibrating = True
+    decoded = 0
+    encode_failed = False
+    loads, dumps = json.loads, json.dumps
+
+    def payload(depth: int) -> str:
+        return (
             '{"path":"visible.txt","nested":'
             + "[" * depth
             + '"private-depth-bytes"'
             + "]" * depth
             + "}"
         )
-        receipts = []
+
+    def observe_loads(value, *args, **kwargs):
+        nonlocal decoded
+        if isinstance(value, str) and value.strip() == encoded:
+            if calibrating:
+                # Probe on the real decoder stack, not a version-specific depth.
+                lower, upper = 0, 2 * sys.getrecursionlimit()
+                with pytest.raises(RecursionError):
+                    loads(payload(upper), *args, **kwargs)
+                while lower + 1 < upper:
+                    middle = (lower + upper) // 2
+                    try:
+                        loads(payload(middle), *args, **kwargs)
+                    except RecursionError:
+                        upper = middle
+                    else:
+                        lower = middle
+                decoder_limits.append(lower)
+            result = loads(value, *args, **kwargs)
+            decoded += 1
+            return result
+        return loads(value, *args, **kwargs)
+
+    def observe_dumps(value, *args, **kwargs):
+        nonlocal encode_failed
+        try:
+            return dumps(value, *args, **kwargs)
+        except RecursionError:
+            if isinstance(value, dict) and value.get("name") == target_name:
+                encode_failed = True
+            raise
+
+    monkeypatch.setattr(json, "loads", observe_loads)
+    monkeypatch.setattr(json, "dumps", observe_dumps)
+
+    async def run_depth(depth: int):
+        nonlocal encoded
+        encoded = payload(depth)
         tools, _ = await owned_rpc_turn(
             monkeypatch,
             tmp_path,
@@ -611,27 +674,50 @@ async def test_decoded_depth_fails_final_encode_without_losing_record(
             else None,
             native_error=False,
             inject_band_tools=False,
-            child_receipts=receipts,
         )
         calls = [
             json.loads(event["content"]) for event in events_of_type(tools, "tool_call")
         ]
-        target = next(
-            call
-            for call in calls
-            if call["name"]
-            == ("band_no_reply" if path == "native" else "omp_permission")
-        )
-        assert len(events_of_type(tools, "tool_result")) == 2
+        results = [
+            json.loads(event["content"])
+            for event in events_of_type(tools, "tool_result")
+        ]
+        target = next((call for call in calls if call["name"] == target_name), None)
+        assert target is not None, calls
+        assert len(calls) == len(results) == 2
+        assert {(result["name"], result["tool_call_id"]) for result in results} == {
+            (call["name"], call["tool_call_id"]) for call in calls
+        }
+        native = next(call for call in calls if call["name"] != "omp_permission")
+        assert native["tool_call_id"] == "ui-wire-id"
         assert tools.turn.complete is (path == "native")
         assert tools.chat == []
-        assert receipts and all(receipt["returncode"] == 0 for receipt in receipts)
-        if target["args"].get("arguments") == "[private payload unavailable]":
-            assert target["args"] == {
-                "path": "visible.txt",
-                "arguments": "[private payload unavailable]",
-            }
-            assert "private-depth-bytes" not in json.dumps(calls)
-            break
-    else:
-        pytest.fail("No successfully decoded payload reached the encode boundary")
+        return calls, target
+
+    await run_depth(0)
+    assert decoder_limits
+    depth = min(decoder_limits)
+    calibrating = False
+    decoded = 0
+    encode_failed = False
+    calls, target = await run_depth(depth)
+    assert decoded
+    if not encode_failed:
+        arguments = (
+            target["args"]["arguments"] if path == "permission" else target["args"]
+        )
+        assert arguments["path"] == "visible.txt"
+        nested = arguments["nested"]
+        for _ in range(depth):
+            assert isinstance(nested, list) and len(nested) == 1
+            nested = nested[0]
+        assert nested == "private-depth-bytes"
+        pytest.skip(
+            f"Python {sys.version.split()[0]} encodes the maximum decoded depth "
+            f"({depth}); no natural decode-success/encode-failure window"
+        )
+    assert target["args"] == {
+        "path": "visible.txt",
+        "arguments": "[private payload unavailable]",
+    }
+    assert "private-depth-bytes" not in dumps(calls)
