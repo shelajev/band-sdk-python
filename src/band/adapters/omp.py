@@ -574,47 +574,45 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
     ) -> tuple[str, dict[str, JsonValue]]:
         kind = "execute" if tool_name == "write" else "read"
         native_name, native_arguments = tool_name, arguments
-        if preserve_native_semantics:
-            enabled = frozenset(
-                item.name
-                for item in iter_tool_definitions(
-                    capabilities=self.features.capabilities | {Capability.CONTACTS}
-                )
-            )
-            native_name, normalized = normalize_omp_mcp_device_call(
-                tool_name, arguments, enabled, kind=kind
-            )
-            native_arguments = cast(dict[str, JsonValue], normalized)
-        names = frozenset(
-            item.name
-            for item in iter_tool_definitions(capabilities=frozenset(Capability))
-        )
         try:
+            if preserve_native_semantics:
+                enabled = frozenset(
+                    item.name
+                    for item in iter_tool_definitions(
+                        capabilities=self.features.capabilities | {Capability.CONTACTS}
+                    )
+                )
+                native_name, normalized = normalize_omp_mcp_device_call(
+                    tool_name, arguments, enabled, kind=kind
+                )
+                native_arguments = cast(dict[str, JsonValue], normalized)
+            names = frozenset(
+                item.name
+                for item in iter_tool_definitions(capabilities=frozenset(Capability))
+            )
             name, normalized = normalize_omp_mcp_device_call(
                 tool_name, arguments, names, kind=kind
             )
-        except ValueError:
+            # Bare aliases use Band's privacy policy without relabelling events.
+            redaction_name = f"band_{name}" if f"band_{name}" in names else name
+            privacy_arguments = cast(dict[str, JsonValue], normalized)
+            redacted = redact_tool_call_args(redaction_name, privacy_arguments)
             if not preserve_native_semantics:
-                raise
-            # A privacy-only decode must not change a withheld native event.
-            # Recognize the device without parsing its content, then redact it.
-            name, _ = normalize_omp_mcp_device_call(
-                tool_name, {**arguments, "content": None}, names, kind=kind
-            )
-            normalized = arguments
-        # Bare Band aliases need the same privacy policy, without relabelling
-        # native events or treating another server's tool as a Band tool.
-        redaction_name = f"band_{name}" if f"band_{name}" in names else name
-        privacy_arguments = cast(dict[str, JsonValue], normalized)
-        redacted = redact_tool_call_args(redaction_name, privacy_arguments)
-        if not preserve_native_semantics:
-            return name, redacted
-        if native_name == name or privacy_arguments == arguments:
-            return native_name, redacted
-        if redacted == privacy_arguments:
-            return native_name, native_arguments
-        # Keep the withheld device's path, other fields and string payload.
-        return native_name, {**native_arguments, "content": json.dumps(redacted)}
+                return name, redacted
+            if native_name == name or privacy_arguments == arguments:
+                return native_name, redacted
+            if redacted == privacy_arguments:
+                return native_name, native_arguments
+            # Keep the withheld device's path, other fields and string payload.
+            return native_name, {**native_arguments, "content": json.dumps(redacted)}
+        except Exception:  # noqa: BLE001 - privacy failures must not discard native records
+            # Never retry failed privacy work or let it discard the native pair.
+            if "content" in native_arguments:
+                return native_name, {
+                    **native_arguments,
+                    "content": "[private payload unavailable]",
+                }
+            return native_name, {"arguments": "[private payload unavailable]"}
 
     def _permission_arguments(self, title: str) -> dict[str, JsonValue]:
         """Project a UI title through the native tool normalization owner."""

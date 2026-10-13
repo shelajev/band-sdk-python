@@ -400,3 +400,113 @@ async def test_oversized_permission_integer_uses_placeholder(
     assert len(events_of_type(tools, "tool_result")) == 2
     assert not tools.turn.complete
     assert tools.chat == []
+
+
+@pytest.mark.parametrize("path", ["enabled-native", "withheld-native", "permission"])
+@pytest.mark.parametrize(
+    "shape", ["surrogate", "integer-limit", "deep", "malformed", "non-object"]
+)
+async def test_adversarial_projection_preserves_record_identity(
+    monkeypatch, tmp_path: Path, path: str, shape: str
+) -> None:
+    secret = "adversarial-private-content"
+    match shape:
+        case "surrogate":
+            encoded = '{"filename":"private.txt","content":"\\ud800"}'
+        case "integer-limit":
+            encoded = (
+                '{"content":' + json.dumps(secret) + ',"count":' + "9" * 5000 + "}"
+            )
+        case "deep":
+            encoded = "[" * 20000 + json.dumps(secret) + "]" * 20000
+        case "malformed":
+            encoded = '{"content":' + json.dumps(secret)
+        case _:
+            encoded = json.dumps([secret])
+    device = {
+        "path": (
+            "xd://mcp__band_send_message"
+            if path == "enabled-native"
+            else "xd://mcp__band_send_room_file"
+        ),
+        "content": encoded,
+        "append": False,
+        "mode": "owned",
+    }
+    title = (
+        "Allow tool: write\nArguments: " + json.dumps(device)
+        if path == "permission"
+        else "A question"
+    )
+    receipts = []
+    limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    try:
+        tools, _ = await owned_rpc_turn(
+            monkeypatch,
+            tmp_path,
+            title,
+            "native-first",
+            native_name="read" if path == "permission" else "write",
+            native_arguments=None if path == "permission" else device,
+            inject_band_tools=False,
+            child_receipts=receipts,
+        )
+    finally:
+        sys.set_int_max_str_digits(limit)
+    calls = [
+        json.loads(event["content"]) for event in events_of_type(tools, "tool_call")
+    ]
+    results = [
+        json.loads(event["content"]) for event in events_of_type(tools, "tool_result")
+    ]
+    permission = next(call for call in calls if call["name"] == "omp_permission")
+    native = next(call for call in calls if call["name"] != "omp_permission")
+    expected_name = (
+        "read"
+        if path == "permission"
+        else (
+            "band_send_message"
+            if path == "enabled-native" and shape != "deep"
+            else "write"
+        )
+    )
+    assert native["name"] == expected_name
+    assert native["tool_call_id"] == "ui-wire-id"
+    assert permission["tool_call_id"] != "ui-wire-id"
+    assert {(result["name"], result["tool_call_id"]) for result in results} == {
+        (expected_name, "ui-wire-id"),
+        ("omp_permission", permission["tool_call_id"]),
+    }
+    if path == "permission":
+        assert permission["args"]["tool_name"] == (
+            "write" if shape == "deep" else "band_send_room_file"
+        )
+        projected = permission["args"]["arguments"]
+    else:
+        projected = native["args"]
+    if path == "enabled-native" and shape == "surrogate":
+        assert projected == {"filename": "private.txt", "content": "\ud800"}
+    elif path == "permission" and shape == "surrogate":
+        assert projected == {
+            "filename": "private.txt",
+            "content": "<3 byte file content>",
+        }
+    else:
+        assert set(projected) == set(device)
+        assert projected["path"] == device["path"]
+        assert projected["append"] is False
+        assert projected["mode"] == "owned"
+        if path != "enabled-native" or shape == "deep":
+            assert secret not in projected["content"]
+        else:
+            assert projected["content"] == encoded
+        if path == "withheld-native" and shape == "surrogate":
+            assert json.loads(projected["content"]) == {
+                "filename": "private.txt",
+                "content": "<3 byte file content>",
+            }
+    assert all(result["is_error"] for result in results)
+    assert not tools.turn.complete
+    assert tools.chat == []
+    assert receipts and all(receipt["returncode"] == 0 for receipt in receipts)

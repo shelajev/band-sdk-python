@@ -224,6 +224,12 @@ text/image tool results.
   placeholder. Synthetic IDs use `band-permission:`; metadata retains the
   original `omp_request_id`. Native event IDs are never changed or merged with
   permission records.
+  The shared file-content redactor counts UTF-8 bytes with surrogate preservation,
+  so lone surrogates cannot discard a tool event in any adapter. The shared OMP
+  normalizer treats all decoder `ValueError`s as unparseable executed payloads,
+  retaining its existing failed-tool identity. Unexpected privacy-projection
+  exceptions replace the payload with a fixed opaque placeholder without retrying;
+  native identity and device wrapper fields remain intact.
 
 ## Server prompt outcomes
 
