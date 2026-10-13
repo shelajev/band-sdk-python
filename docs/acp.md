@@ -12,7 +12,7 @@ safety qualification; see [idle room resource retention](idle-room-release.md).
 `ACPClientAdapterConfig` holds the plain settings; `CursorACPAdapterConfig`,
 `CopilotACPAdapterConfig` and `OmpACPAdapterConfig` extend it with backend defaults
 and fields. Callables (`workspace_for_room`, `resolve_session_config`,
-`resolve_permission`, `resolve_mcp_servers`) are keyword-only constructor arguments.
+`resolve_permission`) are keyword-only constructor arguments.
 
 ```python
 from band.adapters import ACPClientAdapter, ACPClientAdapterConfig
@@ -23,6 +23,8 @@ config = ACPClientAdapterConfig.model_validate(
 adapter = ACPClientAdapter(config)
 assert adapter.config.command == ("codex-acp",)
 ```
+
+`resolve_mcp_servers` is an optional keyword-only constructor callback.
 
 ## Band tools
 
