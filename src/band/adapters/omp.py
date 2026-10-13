@@ -134,6 +134,27 @@ class OmpPermissionRequest(BaseModel):
 PermissionResolver = Callable[[OmpPermissionRequest], Awaitable[str | None]]
 
 
+def _permission_arguments(title: str) -> dict[str, JsonValue]:
+    """Project a UI title without exposing a tool's raw argument section."""
+    header, separator, encoded = title.partition("Arguments:")
+    if not separator:
+        return {"message": title}
+    if header.startswith("Allow tool: ") and header.endswith("\n"):
+        tool_name = header.removeprefix("Allow tool: ").removesuffix("\n")
+        if tool_name and tool_name == tool_name.strip() and "\n" not in tool_name:
+            try:
+                arguments = json.loads(encoded)
+                if isinstance(arguments, dict):
+                    return {
+                        "message": header.removesuffix("\n"),
+                        "tool_name": tool_name,
+                        "arguments": redact_tool_call_args(tool_name, arguments),
+                    }
+            except (json.JSONDecodeError, RecursionError, UnicodeError):
+                pass
+    return {"message": f"{header}Arguments: [arguments unavailable]"}
+
+
 class _ThinkingLevels(BaseModel):
     levels: tuple[str, ...]
 
@@ -592,11 +613,9 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
             if choice is not None and choice in options
             else OmpUIResponse(cancelled=True)
         )
-        # Permission decisions narrate no Band tool effect. Native execution
-        # frames and synthetic requests use disjoint room-event ID namespaces.
-        if Emit.TOOL_CALLS in self.features.emit and (
-            response.cancelled or response.value == "Deny"
-        ):
+        # A selected UI value has no generic approval/denial meaning. Only the
+        # cancelled outcome is authoritative; native tool events stay independent.
+        if Emit.TOOL_CALLS in self.features.emit and response.cancelled:
             name = "omp_permission"
             call_id = f"band-permission:{uuid4().hex}"
             metadata = {
@@ -612,9 +631,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 json.dumps(
                     {
                         "name": name,
-                        "args": redact_tool_call_args(
-                            name, {"message": request.title or ""}
-                        ),
+                        "args": _permission_arguments(request.title or ""),
                         "tool_call_id": call_id,
                     }
                 ),
@@ -682,7 +699,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                             {
                                 "name": name,
                                 "args": redact_tool_call_args(name, arguments),
-                                "tool_call_id": f"omp-tool:{event.toolCallId}",
+                                "tool_call_id": event.toolCallId,
                             }
                         ),
                         MessageType.TOOL_CALL,
@@ -709,7 +726,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                             {
                                 "name": name,
                                 "output": output,
-                                "tool_call_id": f"omp-tool:{event.toolCallId}",
+                                "tool_call_id": event.toolCallId,
                                 "is_error": bool(event.isError),
                             }
                         ),

@@ -225,19 +225,28 @@ async def test_omp_native_permission_is_denied(
                 for call in tool_calls
                 if call.args.get("message") == FORM_PROBE_TITLE
             ]
-            assert len(probe_calls) == 1, "expected exactly one native permission probe"
-            probe_call = probe_calls[0]
-            assert probe_call.tool_call_id
-            probe_results = [
-                result
-                for result in tool_results
-                if result.tool_call_id == probe_call.tool_call_id
-            ]
-            assert len(probe_results) == 1, "expected the native probe's result"
-            result = probe_results[0]
-            assert result.is_error and "cancelled" in result.output.lower()
-            assert result.raw.metadata is not None
-            assert result.raw.metadata.model_dump()["permission_outcome"] == "cancelled"
+            if decision is None:
+                assert len(probe_calls) == 1, "expected one cancelled permission record"
+                probe_call = probe_calls[0]
+                assert probe_call.tool_call_id
+                probe_results = [
+                    result
+                    for result in tool_results
+                    if result.tool_call_id == probe_call.tool_call_id
+                ]
+                assert len(probe_results) == 1, (
+                    "expected the permission record's result"
+                )
+                result = probe_results[0]
+                assert result.is_error and "cancelled" in result.output.lower()
+                assert result.raw.metadata is not None
+                assert (
+                    result.raw.metadata.model_dump()["permission_outcome"]
+                    == "cancelled"
+                )
+            else:
+                # An offered UI selection is not an SDK cancellation outcome.
+                assert probe_calls == []
             assert sum(request.title == FORM_PROBE_TITLE for request in requests) == 1
             assert all(
                 request.room_id == room_id

@@ -12,10 +12,9 @@ from band.adapters.omp import (
     OmpAdapter,
     OmpAdapterConfig,
     OmpPermissionRequest,
-    OmpTurn,
 )
 from band.converters.omp import OmpSessionState
-from band.integrations.ompwire import OmpEvent, OmpUIRequest
+from band.integrations.ompwire import OmpUIRequest
 from band.runtime.tools.types import BandTool
 from band.testing import FakeAgentTools
 from band.testing.fake_tools import events_of_type
@@ -165,17 +164,19 @@ async def test_direct_native_permissions_remain_cancelled(name: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("method", "choice", "cancelled", "pairs"),
+    ("method", "choice", "options", "cancelled", "pairs"),
     [
-        ("select", "Approve", False, 0),
-        ("select", "Deny", False, 1),
-        ("select", None, True, 1),
-        ("select", "Always", True, 1),
-        ("notify", "Approve", True, 0),
+        ("select", "Approve", ["Approve", "Deny"], False, 0),
+        ("select", "Deny", ["Approve", "Deny"], False, 0),
+        ("select", "Reject", ["Accept", "Reject"], False, 0),
+        ("select", None, ["Accept", "Reject"], True, 1),
+        ("select", "Deny", ["Accept", "Reject"], True, 1),
+        ("select", "Always", ["Approve", "Deny"], True, 1),
+        ("notify", "Approve", ["Approve", "Deny"], True, 0),
     ],
 )
 async def test_only_denied_selects_are_narrated_without_turn_effects(
-    method: str, choice: str | None, cancelled: bool, pairs: int
+    method: str, choice: str | None, options: list[str], cancelled: bool, pairs: int
 ) -> None:
     async def resolve(_request: OmpPermissionRequest) -> str | None:
         return choice
@@ -187,7 +188,7 @@ async def test_only_denied_selects_are_narrated_without_turn_effects(
             id="decision",
             method=method,
             title="Allow tool: write",
-            options=["Approve", "Deny"],
+            options=options,
         ),
         "room",
         "session",
@@ -218,49 +219,5 @@ async def test_permission_narration_respects_disabled_tool_events() -> None:
     assert denied.cancelled
     assert events_of_type(tools, "tool_call") == []
     assert events_of_type(tools, "tool_result") == []
-    assert not tools.turn.complete
-    assert tools.chat == []
-
-
-async def test_permission_ids_are_unique_and_disjoint_from_native_ids() -> None:
-    adapter = OmpAdapter(
-        resolve_permission=partial(deny_probe_allow_completion, probe_decision=None)
-    )
-    tools = FakeAgentTools()
-    request = OmpUIRequest(id="reused-wire-id", method="select", title=FORM_PROBE_TITLE)
-    await adapter._permission(request, "room", "session", tools)
-    first_id = json.loads(events_of_type(tools, "tool_call")[0]["content"])[
-        "tool_call_id"
-    ]
-    turn = OmpTurn(tools)
-    await adapter._emit_event(
-        OmpEvent(
-            type="tool_execution_start",
-            toolCallId=first_id,
-            toolName="read",
-            args={"path": "unrelated.txt"},
-        ),
-        turn,
-    )
-    await adapter._emit_event(
-        OmpEvent(
-            type="tool_execution_end",
-            toolCallId=first_id,
-            toolName="read",
-            isError=True,
-        ),
-        turn,
-    )
-    await adapter._permission(request, "room", "session", tools)
-    call_ids = [
-        json.loads(event["content"])["tool_call_id"]
-        for event in events_of_type(tools, "tool_call")
-    ]
-    result_ids = [
-        json.loads(event["content"])["tool_call_id"]
-        for event in events_of_type(tools, "tool_result")
-    ]
-    assert len(call_ids) == len(set(call_ids)) == 3
-    assert result_ids == call_ids
     assert not tools.turn.complete
     assert tools.chat == []
