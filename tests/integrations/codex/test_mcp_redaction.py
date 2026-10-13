@@ -35,7 +35,7 @@ def redactor() -> Any:
     ).redactor
 
 
-async def test_stderr_and_malformed_rpc_keep_context_without_secrets(
+async def test_stderr_and_malformed_rpc_log_metadata_without_payloads(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="band.integrations.codex.stdio_client")
@@ -52,9 +52,54 @@ async def test_stderr_and_malformed_rpc_keep_context_without_secrets(
     rendered = caplog.text
     assert SECRET not in rendered
     assert json.dumps(SECRET)[1:-1] not in rendered
-    assert "connection failed" in rendered
-    assert "malformed" in rendered
-    assert "unexpected" in rendered
+    assert "connection failed" not in rendered
+    assert "malformed" not in rendered
+    assert "unexpected" not in rendered
+    assert "type=str" in rendered
+    assert "type=list" in rendered
+    assert "type=dict" in rendered
+    for payload in (
+        "malformed " + SECRET,
+        json.dumps([SECRET]),
+        json.dumps({"unexpected": SECRET}),
+    ):
+        assert f"length={len(payload)}" in rendered
+
+
+@pytest.mark.parametrize("request_id", [None, 7])
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [
+        ("item/tool/call", "item/tool/call"),
+        ("$/cancelRequest", "$/cancelRequest"),
+        ("m" * 128, "m" * 128),
+        ("m" * 129, "<unrecognized method>"),
+        ("item/tool/call\n", "<unrecognized method>"),
+        ("méthode", "<unrecognized method>"),
+        ("Bearer " + SECRET, "<unrecognized method>"),
+        ({"token": SECRET}, "<unrecognized method>"),
+        (7, "<unrecognized method>"),
+    ],
+)
+async def test_full_rpc_queue_logs_only_protocol_method_identifiers(
+    caplog: pytest.LogCaptureFixture,
+    request_id: int | None,
+    method: Any,
+    expected: str,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="band.integrations.codex.rpc_base")
+    client = CodexStdioClient(redactor=redactor())
+    client._events = asyncio.Queue(maxsize=1)
+    await client._dispatch_rpc_message(json.dumps({"method": "occupied"}))
+    await client._dispatch_rpc_message(
+        json.dumps({"id": request_id, "method": method, "params": {"token": SECRET}})
+    )
+    rendered = caplog.text
+    assert SECRET not in rendered
+    assert "token" not in rendered
+    assert expected in rendered
+    if expected == "<unrecognized method>" and isinstance(method, str):
+        assert method not in rendered
 
 
 async def test_rpc_error_message_and_nested_data_are_redacted() -> None:

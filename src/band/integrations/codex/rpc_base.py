@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -16,6 +17,14 @@ from band.integrations.codex.types import CodexRequestMethod
 logger = logging.getLogger(__name__)
 
 JsonRpcId = int | str
+
+_PROTOCOL_METHOD = re.compile(r"[A-Za-z0-9_./$-]{1,128}")
+
+
+def _diagnostic_method(method: Any) -> str:
+    if isinstance(method, str) and _PROTOCOL_METHOD.fullmatch(method):
+        return method
+    return "<unrecognized method>"
 
 
 class CodexJsonRpcError(RuntimeError):
@@ -86,9 +95,6 @@ class BaseJsonRpcClient:
         self._request_id = 0
         self._connected = False
         self._transport_label = "payload"  # overridden by subclasses for diagnostics
-
-    def _redact_text(self, text: str) -> str:
-        return self._redactor.text(text) if self._redactor is not None else text
 
     def _redact_value(self, value: Any) -> Any:
         return self._redactor.value(value) if self._redactor is not None else value
@@ -265,15 +271,19 @@ class BaseJsonRpcClient:
             message = json.loads(text)
         except json.JSONDecodeError:
             logger.warning(
-                "Skipping non-JSON %s: %s",
+                "Skipping non-JSON %s (type=%s, length=%d)",
                 self._transport_label,
-                self._redact_text(text),
+                type(text).__name__,
+                len(text),
             )
             return
 
         if not isinstance(message, dict):
             logger.warning(
-                "Skipping non-object JSON-RPC payload: %s", self._redact_value(message)
+                "Skipping non-object JSON-RPC %s (type=%s, length=%d)",
+                self._transport_label,
+                type(message).__name__,
+                len(text),
             )
             return
 
@@ -294,7 +304,7 @@ class BaseJsonRpcClient:
             except asyncio.QueueFull:
                 logger.warning(
                     "Event queue full; dropping server request %s",
-                    self._redact_text(str(method)),
+                    _diagnostic_method(method),
                 )
             return
 
@@ -312,7 +322,7 @@ class BaseJsonRpcClient:
             except asyncio.QueueFull:
                 logger.warning(
                     "Event queue full; dropping notification %s",
-                    self._redact_text(str(method)),
+                    _diagnostic_method(method),
                 )
             return
 
@@ -326,7 +336,10 @@ class BaseJsonRpcClient:
             return
 
         logger.debug(
-            "Ignoring unknown JSON-RPC payload: %s", self._redact_value(message)
+            "Ignoring unknown JSON-RPC %s (type=%s, length=%d)",
+            self._transport_label,
+            type(message).__name__,
+            len(text),
         )
 
     def _next_request_id(self) -> int:

@@ -128,8 +128,13 @@ workspace path and returning `Mapping[str, CodexMcpServer]`. Import
   closes it and resolves a fresh grant. Positive readiness preserves genuine
   missing-history fallback and unrelated thread errors.
 
-Scoped redaction covers process stderr, malformed RPC diagnostics and forwarded
-RPC errors. Error frames are sanitized before routing to a waiting request, so
-consumption after owned teardown cannot expose the released secret scope.
+Transport logs omit RPC and process-stderr payload contents. Unrecognized RPC
+frames report only transport, decoded type and character length; stderr reports
+byte length. Queue-full diagnostics retain a method only when it matches the
+bounded protocol identifier grammar `[A-Za-z0-9_./$-]{1,128}`; other methods are
+reported as `<unrecognized method>`. Cleanup failures report only their type.
+Scoped redaction still covers forwarded RPC errors. Error frames are sanitized
+before routing to a waiting request, so consumption after owned teardown cannot
+expose the released secret scope.
 Model selection, skill roots, native
 sandbox/approval settings, real resume and Band's `dynamicTools` path are unchanged.

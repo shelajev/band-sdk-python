@@ -172,12 +172,9 @@ class CodexStdioClient(BaseJsonRpcClient):
 
     def _log_close_failure(self, task: asyncio.Task[None]) -> None:
         if not task.cancelled() and (error := task.exception()) is not None:
-            if self._redactor is not None:
-                logger.error(
-                    "Codex subprocess cleanup failed: %s", self._redact_text(str(error))
-                )
-            else:
-                logger.error("Codex subprocess cleanup failed", exc_info=error)
+            logger.error(
+                "Codex subprocess cleanup failed (type=%s)", type(error).__name__
+            )
 
     async def _close_process(self) -> None:
         readers = [
@@ -246,9 +243,8 @@ class CodexStdioClient(BaseJsonRpcClient):
                 line = await self._proc.stderr.readline()
                 if not line:
                     return
-                text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    logger.debug("codex stderr: %s", self._redact_text(text))
+                if line.rstrip():
+                    logger.debug("codex stderr (type=bytes, length=%d)", len(line))
         except asyncio.CancelledError:
             raise
         except Exception:
