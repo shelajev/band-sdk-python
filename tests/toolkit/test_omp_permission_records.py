@@ -53,8 +53,10 @@ async def owned_rpc_turn(
             assert isinstance(peer_pid, int)
             peer_identity = await asyncio.to_thread(psutil.Process, peer_pid)
             await asyncio.to_thread(peer_identity.create_time)
-            assert peer_identity == self._process_identity or self._process_identity in (
-                await asyncio.to_thread(peer_identity.parents)
+            assert (
+                peer_identity == self._process_identity
+                or self._process_identity
+                in (await asyncio.to_thread(peer_identity.parents))
             )
             clients.append((self, peer_identity))
 
@@ -627,8 +629,12 @@ async def test_decoded_depth_fails_final_encode_without_losing_record(
             if calibrating:
                 # Probe on the real decoder stack, not a version-specific depth.
                 lower, upper = 0, 2 * sys.getrecursionlimit()
-                with pytest.raises(RecursionError):
-                    loads(payload(upper), *args, **kwargs)
+                while True:
+                    try:
+                        loads(payload(upper), *args, **kwargs)
+                    except RecursionError:
+                        break
+                    lower, upper = upper, upper * 2
                 while lower + 1 < upper:
                     middle = (lower + upper) // 2
                     try:
