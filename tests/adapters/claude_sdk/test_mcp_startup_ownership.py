@@ -820,6 +820,8 @@ async def test_a_failing_reuse_decision_stays_a_safe_non_resume_failure(
         workspaces=RoomWorkspaces(lambda room_id: str(tmp_path / room_id)),
         resolve_mcp_servers=resolver if with_resolver else None,
     )
+    adapter = ClaudeSDKAdapter()
+    adapter._session_manager = manager
     calls: list[str | None] = []
     original = manager.get_or_create_session
 
@@ -848,7 +850,7 @@ async def test_a_failing_reuse_decision_stays_a_safe_non_resume_failure(
             caplog.at_level(logging.WARNING),
             pytest.raises(ClaudeMcpStartupError) as caught,
         ):
-            await ClaudeSDKAdapter._open_session(manager, "room-a", "hist-1")
+            await adapter._open_session(manager, "room-a", "hist-1")
     finally:
         client.options = real_options
         if real_identity is not None:

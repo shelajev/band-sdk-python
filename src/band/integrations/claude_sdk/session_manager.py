@@ -246,17 +246,32 @@ class ClaudeSessionManager:
     def _loop_running(self) -> bool:
         return self._task is not None
 
-    def is_startup_task(self, task: asyncio.Task[Any] | None) -> bool:
-        """Whether ``task`` is a session startup this manager's teardown waits
-        for (registered, or already held by a room retirement); such a task
-        must request teardown without waiting on it."""
+    def is_startup_task(
+        self, task: asyncio.Task[Any] | None, *, room_id: str | None = None
+    ) -> bool:
+        """Whether ``task`` is a startup teardown waits for, optionally in one
+        room; such a task must request its own teardown without awaiting it."""
         if task is None:
             return False
-        startups = [
-            *self._startups.values(),
-            *(r.startup for r in self._retirements.values() if r.startup is not None),
-        ]
-        return any(startup.worker is task for startup in startups)
+        startups: list[RoomStartup | None]
+        if room_id is None:
+            startups = [
+                *self._startups.values(),
+                *(
+                    r.startup
+                    for r in self._retirements.values()
+                    if r.startup is not None
+                ),
+            ]
+        else:
+            held = self._retirements.get(room_id)
+            startups = [
+                self._startups.get(room_id),
+                None if held is None else held.startup,
+            ]
+        return any(
+            startup is not None and startup.worker is task for startup in startups
+        )
 
     def close_admission(self) -> None:
         """Refuse every new session from now on and retire every startup; the
@@ -490,6 +505,7 @@ class ClaudeSessionManager:
             result=asyncio.get_running_loop().create_future(),
             waiters=1,
         )
+        registered: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         # From here to registration nothing can fail or call out: the startup
         # takes over whatever the room still holds -- a client, or only a file
         # an earlier cleanup could not remove -- and its worker must close it,
@@ -502,8 +518,10 @@ class ClaudeSessionManager:
             ) = self._take_session(room_id)
         self._startups[room_id] = startup
         startup.worker = asyncio.create_task(
-            self._run_startup(startup), name=f"claude-startup:{room_id}"
+            self._run_startup(startup, registered), name=f"claude-startup:{room_id}"
         )
+        if not registered.done():
+            registered.set_result(None)
         return startup
 
     def _protected_identity(self, room_id: str) -> Any:
@@ -571,9 +589,13 @@ class ClaudeSessionManager:
         )
         return await asyncio.shield(result)
 
-    async def _run_startup(self, startup: RoomStartup) -> None:
+    async def _run_startup(
+        self, startup: RoomStartup, registered: asyncio.Future[None]
+    ) -> None:
         room_id = startup.room_id
         try:
+            # An eager factory must not call out before the worker is registered.
+            await registered
             if (
                 startup.stale_client is not None
                 or startup.stale_transport is not None
@@ -1012,15 +1034,7 @@ class ClaudeSessionManager:
         """
         if not self._loop_running:
             return
-        current = asyncio.current_task()
-        held = self._retirements.get(room_id)
-        self_requested = any(
-            candidate is not None and candidate.worker is current
-            for candidate in (
-                self._startups.get(room_id),
-                None if held is None else held.startup,
-            )
-        )
+        self_requested = self.is_startup_task(asyncio.current_task(), room_id=room_id)
         while True:
             retirement = self._begin_room_retirement(
                 room_id, release_workspace=release_workspace

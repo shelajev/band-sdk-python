@@ -111,9 +111,11 @@ reuse the failed client or take another room's claimed directory.
   caller stops waiting, the startup's own task is cancelled (even if the
   callback swallows it), or the room is cleaned up, the startup is retired: it
   publishes nothing, is cancelled at most once, and keeps its process, file and
-  workspace claim until it settles. A callback may itself request session-manager
-  room cleanup or adapter-wide teardown; that request returns without waiting on
-  the startup it came from.
+  workspace claim until it settles. A callback may itself clean up its room or
+  the adapter; that request returns without waiting on the startup it came from.
+  An adapter-room self-request immediately fences the room and retires its
+  startup; the existing turn worker finishes the shared close after startup and
+  native custody settle, before releasing the room for new input.
   Admission is rechecked, without calling out, after every callback the startup
   runs: a callback that closes admission or retires the room stops any later
   reuse, client construction or publication. The reuse decision is settled to a

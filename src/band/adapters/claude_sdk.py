@@ -679,6 +679,9 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         self._turn_tasks: dict[str, TurnTask] = {}
         self._room_cleanup: dict[str, asyncio.Task[None]] = {}
         self._closing_rooms: set[str] = set()
+        # A startup cannot await the worker awaiting its result. That worker
+        # finishes a self-requested room close once the startup has settled.
+        self._deferred_room_cleanup: dict[str, TurnTask] = {}
         self._closing_all = False
 
     @property
@@ -1138,9 +1141,13 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             await self._retire_client(room_id)
             raise
         finally:
-            self._release_turn(room_id, release_future)
-            if self._turn_tasks.get(room_id) is owner:
-                del self._turn_tasks[room_id]
+            try:
+                if self._deferred_room_cleanup.get(room_id) is owner:
+                    await self._finish_startup_room_cleanup(room_id, owner, manager)
+            finally:
+                self._release_turn(room_id, release_future)
+                if self._turn_tasks.get(room_id) is owner:
+                    del self._turn_tasks[room_id]
 
     def _release_turn(
         self, room_id: str, release_future: asyncio.Future[None] | None = None
@@ -1671,15 +1678,47 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
 
     async def on_cleanup(self, room_id: str) -> None:
         """Clean up Claude SDK session and stored tools when agent leaves a room."""
+        manager = self._session_manager
+        owner = self._turn_tasks.get(room_id)
+        if (
+            manager is not None
+            and owner is not None
+            and manager.is_startup_task(asyncio.current_task(), room_id=room_id)
+        ):
+            self._closing_rooms.add(room_id)
+            self._clear_pending_approvals_for_room(room_id)
+            self._deferred_room_cleanup[room_id] = owner
+            await manager.cleanup_session(room_id)
+            return
         await self._retire_room(
             room_id,
             settle=self._cancel_turn,
             close=partial(self._close_room, room_id),
         )
 
+    async def _finish_startup_room_cleanup(
+        self, room_id: str, owner: TurnTask, manager: ClaudeSessionManager
+    ) -> None:
+        # Native retirement waits for the startup, not this turn. Keep its
+        # worker and fence registered until handles and the claim are released.
+        await manager.cleanup_session(room_id)
+        if self._turn_tasks.get(room_id) is owner:
+            del self._turn_tasks[room_id]
+        # No inference or native custody remains in this worker. The shared
+        # close can now finish bookkeeping without trying to drain its caller.
+        await self._retire_room(
+            room_id,
+            settle=self._cancel_turn,
+            close=partial(self._forget_room, room_id),
+        )
+
     async def _close_room(self, room_id: str) -> None:
         if self._session_manager:
             await self._session_manager.cleanup_session(room_id)
+        await self._forget_room(room_id)
+
+    async def _forget_room(self, room_id: str) -> None:
+        self._deferred_room_cleanup.pop(room_id, None)
         self._room_tools.pop(room_id, None)
         self._mcp_room_tools.pop(room_id, None)
         self._session_context.pop(room_id, None)
@@ -1752,6 +1791,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         self._pending_tool_names.clear()
         self._turn_release.clear()
         self._turn_tasks.clear()
+        self._deferred_room_cleanup.clear()
 
     def _require_admitting(
         self, manager: ClaudeSessionManager | None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from band.adapters.claude_sdk import ClaudeSDKAdapterConfig
 from band.client.streaming import ControlMode
 from band.core.exceptions import CleanupIncompleteError, InputNotAccepted
 from band.core.turn_lifecycle import TurnTask
+from band.integrations.claude_sdk.mcp_startup import ClaudeMcpStartupError
 from tests.adapters.claude_sdk.fakecli import Hold
 from tests.adapters.claude_sdk.helpers import ClaudeRoom
 from tests.conftest import eager_tasks, requires_eager_tasks
@@ -304,3 +306,160 @@ class TestStartupOwner:
         assert len(calls) == 1
         assert room.chat == ["Ready."]
         assert room.failures == []
+
+    @pytest.mark.parametrize(
+        "eager",
+        [
+            pytest.param(False, id="default"),
+            pytest.param(True, marks=requires_eager_tasks, id="eager"),
+        ],
+    )
+    async def test_a_resolver_can_clean_up_its_own_adapter_room(
+        self, claude_room: OpenRoom, tmp_path: Path, eager: bool
+    ) -> None:
+        room_ref: list[ClaudeRoom] = []
+        returned = asyncio.Event()
+        calls: list[str] = []
+        workspace = tmp_path / "shared"
+        marker = workspace / "keep.txt"
+
+        async def resolver(path: str) -> Mapping[str, Any]:
+            calls.append(path)
+            if len(calls) == 1:
+                room = room_ref[0]
+                manager = room.adapter._session_manager
+                assert manager is not None and manager.owns_resources()
+                marker.write_text("membership files stay", encoding="utf-8")
+                await room.adapter.on_cleanup(room.room_id)
+                returned.set()
+            return {}
+
+        room = await claude_room(
+            workspace_for_room=lambda room_id: str(workspace),
+            resolve_mcp_servers=resolver,
+        )
+        room_ref.append(room)
+        with eager_tasks() if eager else nullcontext():
+            async with asyncio.timeout(5):
+                [outcome] = await asyncio.gather(
+                    room.send("retire this startup"), return_exceptions=True
+                )
+
+        assert returned.is_set(), "self-cleanup must return to its resolver"
+        assert isinstance(outcome, ClaudeMcpStartupError)
+        assert outcome.stage == "retirement"
+        assert room.claude.sessions == []
+        assert room.claude.prompts == []
+        assert room.chat == []
+        assert len(room.failures) == 1
+        manager = room.adapter._session_manager
+        assert manager is not None and not manager.owns_resources()
+        assert marker.read_text(encoding="utf-8") == "membership files stay"
+
+        other = room.beside("room-2")
+        room.claude.script([other.model_reply("Reclaimed.")])
+        await other.send("use the released workspace")
+        assert calls == [str(workspace), str(workspace)]
+        assert room.chat == []
+        assert other.chat == ["Reclaimed."]
+
+    async def test_a_resolver_closes_a_foreign_room_without_deferring_its_turn(
+        self, claude_room: OpenRoom
+    ) -> None:
+        room_ref: list[ClaudeRoom] = []
+        returned = asyncio.Event()
+
+        async def resolver(workspace: str) -> Mapping[str, Any]:
+            if workspace.endswith("room-1"):
+                await room_ref[0].adapter.on_cleanup("room-2")
+                returned.set()
+            return {}
+
+        room = await claude_room(resolve_mcp_servers=resolver)
+        room_ref.append(room)
+        other = room.beside("room-2")
+        work = Hold()
+        room.claude.script(
+            [work],
+            [room.model_reply("Current.")],
+            [other.model_reply("Fresh.")],
+        )
+        sending = other.send_in_background("hold this turn")
+        try:
+            await work.reached.wait()
+            await room.send("clean up the other room")
+        finally:
+            work.released.set()
+            await asyncio.gather(sending, return_exceptions=True)
+
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+        assert returned.is_set()
+        assert room.chat == ["Current."]
+        assert other.chat == []
+        assert room.failures == []
+        assert other.failures == []
+        assert not room.claude.sessions[0].alive
+        await other.send("rejoin")
+        assert other.chat == ["Fresh."]
+        assert room.claude.resumed == [None, None, None]
+
+    @pytest.mark.parametrize("stop_after_cleanup", [False, True])
+    async def test_self_cleanup_keeps_ownership_while_its_resolver_settles(
+        self, claude_room: OpenRoom, tmp_path: Path, stop_after_cleanup: bool
+    ) -> None:
+        room_ref: list[ClaudeRoom] = []
+        hold = Hold()
+        calls: list[str] = []
+        workspace = tmp_path / "shared"
+
+        async def resolver(path: str) -> Mapping[str, Any]:
+            calls.append(path)
+            if len(calls) == 1:
+                room = room_ref[0]
+                await room.adapter.on_cleanup(room.room_id)
+                hold.reached.set()
+                await hold.released.wait()
+            return {}
+
+        room = await claude_room(
+            workspace_for_room=lambda room_id: str(workspace),
+            resolve_mcp_servers=resolver,
+        )
+        room_ref.append(room)
+        manager = room.adapter._session_manager
+        assert manager is not None
+        sending = room.send_in_background("retire this startup")
+        try:
+            await hold.reached.wait()
+            assert manager.owns_resources()
+            assert room.adapter._turn_running(room.room_id)
+            with pytest.raises(InputNotAccepted):
+                await room.send("overlap")
+            if stop_after_cleanup:
+                await room.adapter.on_interrupt(room.room_id, ControlMode.STOP)
+                assert room.adapter._turn_running(room.room_id)
+                assert not sending.done()
+                with pytest.raises(CleanupIncompleteError):
+                    await room.leave()
+            assert room.claude.sessions == []
+            assert room.claude.prompts == []
+        finally:
+            hold.released.set()
+            [outcome] = await asyncio.gather(sending, return_exceptions=True)
+
+        if stop_after_cleanup:
+            assert isinstance(outcome, asyncio.CancelledError)
+            assert room.failures == []
+        else:
+            assert isinstance(outcome, ClaudeMcpStartupError)
+            assert outcome.stage == "retirement"
+            assert len(room.failures) == 1
+        assert not manager.owns_resources()
+        assert not room.adapter._turn_running(room.room_id)
+        other = room.beside("room-2")
+        room.claude.script([other.model_reply("Reclaimed.")])
+        await other.send("use the released workspace")
+        assert calls == [str(workspace), str(workspace)]
+        assert room.chat == []
+        assert other.chat == ["Reclaimed."]
