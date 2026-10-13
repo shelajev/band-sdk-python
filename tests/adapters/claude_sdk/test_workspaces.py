@@ -118,6 +118,7 @@ async def test_cancelled_startup_keeps_claim_but_never_serves_its_client(
         with pytest.raises(asyncio.CancelledError):
             await opening
     claude.connecting = None
+    await room.settled()
     with pytest.raises(ValueError, match="both"):
         await room.beside("room-2").send("hi")
     claude.script([room.model_reply("Connected.")])

@@ -104,8 +104,8 @@ async def test_a_message_caught_by_shutdown_restarts_nothing(
 async def test_a_resume_cut_short_by_shutdown_reports_nothing(
     claude_room: OpenRoom,
 ) -> None:
-    """The shutdown lands while a resume is connecting and the resume fails;
-    the fresh-session fallback must meet the stopped manager quietly."""
+    """Shutdown may cancel the owned preparation or refuse the manager's
+    result; neither outcome retries without history or reports a failure."""
     room = await claude_room()
     room.claude.unresumable.add("sess-earlier")
     room.claude.connecting = connecting = Hold()
@@ -115,7 +115,7 @@ async def test_a_resume_cut_short_by_shutdown_reports_nothing(
         stopping = asyncio.create_task(room.adapter.cleanup_all())
         await asyncio.sleep(0)  # cleanup_all reaches the manager's stop()
 
-    with pytest.raises(ClaudeSessionManagerStoppedError):
+    with pytest.raises((asyncio.CancelledError, ClaudeSessionManagerStoppedError)):
         await sending
     await stopping
 

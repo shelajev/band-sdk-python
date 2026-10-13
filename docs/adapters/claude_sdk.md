@@ -111,20 +111,26 @@ reuse the failed client or take another room's claimed directory.
   caller stops waiting, the startup's own task is cancelled (even if the
   callback swallows it), or the room is cleaned up, the startup is retired: it
   publishes nothing, is cancelled at most once, and keeps its process, file and
-  workspace claim until it settles. A callback may itself clean up its room or
-  the adapter; that request returns without waiting on the startup it came from.
+  workspace claim until it settles. A callback may itself request session-manager
+  room cleanup or adapter-wide teardown; that request returns without waiting on
+  the startup it came from.
   Admission is rechecked, without calling out, after every callback the startup
   runs: a callback that closes admission or retires the room stops any later
   reuse, client construction or publication. The reuse decision is settled to a
   plain yes/no before that last check, so reading it again calls nothing.
+  The shared turn owner is bound before tool binding or asynchronous preparation,
+  so STOP and room retirement also end a turn held in resolution or readiness.
+  A still-settling turn keeps the room fenced; its provider timeout starts only
+  at the query, not during preparation.
 - **Teardown keeps what it can't release.** `cleanup_all()` refuses new turns
   and session startups as soon as it is called, and keeps refusing them until a
   successful `on_started`. A CLI whose exit can't be confirmed within 5 seconds of
   being killed, or a private file that can't be removed (including one only
   partly written), is kept with its workspace claim and the Band server it may
   dial, and the cleanup raises a safe error; calling it again (or `on_started`)
-  retries. While a room still holds such a CLI or file, its next turn first
-  retries removing it and starts no new connection until that succeeds.
+  retries. A failed room cleanup keeps new input unaccepted until `on_cleanup()`
+  succeeds on an explicit retry. A file or client left by a failed startup is
+  retried before a later turn starts a replacement connection.
   Concurrent `cleanup_all()` calls share one teardown that a cancelled caller
   can't abandon.
 

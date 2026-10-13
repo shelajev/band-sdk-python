@@ -23,6 +23,7 @@ from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITra
 from claude_agent_sdk.types import McpServerConfig
 
 from band.adapters.claude_sdk import ClaudeSDKAdapter
+from band.core.exceptions import InputNotAccepted
 from band.integrations.claude_sdk.mcp_startup import (
     ClaudeMcpStartupError,
     McpConfigFile,
@@ -525,7 +526,13 @@ async def test_a_resolver_requesting_teardown_behind_a_settling_turn_publishes_n
         await turn_hold.reached.wait()
         sessions_before = len(claude.sessions)
 
-        with pytest.raises((ClaudeMcpStartupError, ClaudeSessionManagerStoppedError)):
+        with pytest.raises(
+            (
+                asyncio.CancelledError,
+                ClaudeMcpStartupError,
+                ClaudeSessionManagerStoppedError,
+            )
+        ):
             await other.send("hi")
         assert requested.is_set()
     finally:
@@ -593,15 +600,16 @@ async def test_a_file_left_behind_fences_new_connections_until_removed(
     with unremovable(first):
         with pytest.raises(ClaudeMcpStartupError, match="cleanup"):
             await room.leave()
-        # A new turn takes the left-behind file over and can't remove it either:
-        # it launches, resolves and allocates nothing.
-        with pytest.raises(ClaudeMcpStartupError, match="cleanup"):
+        with pytest.raises(InputNotAccepted, match="closing"):
             await room.send("second")
+        with pytest.raises(ClaudeMcpStartupError, match="cleanup"):
+            await room.leave()
         assert len(claude.sessions) == 1
         assert len(resolver.calls) == 1
         assert first.exists()
         assert room.adapter._session_manager.owns_resources()
 
+    await room.leave()
     await room.send("third")
     assert not first.exists()
     assert room.chat == ["A.", "B."]

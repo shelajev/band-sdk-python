@@ -630,8 +630,6 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         # a detached Band backend kept until its stop succeeds.
         self._teardown: asyncio.Task[None] | None = None
         self._retained_backend: BandMCPBackend | None = None
-        # Closed from a teardown request until a successful restart.
-        self._admission_closed = False
 
         # Per-room tools: the adapter's own sends use them directly, while the
         # MCP server's tool calls go through _mcp_room_tools (see _bind_mcp_tools).
@@ -772,7 +770,6 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         can_use_tool_factory = (
             self._make_can_use_tool if self.config.approvals is not None else None
         )
-        self._closing_all = False
         self._session_manager = ClaudeSessionManager(
             sdk_options,
             can_use_tool_factory=can_use_tool_factory,
@@ -780,7 +777,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             workspaces=self._workspaces,
             resolve_mcp_servers=self._resolve_mcp_servers,
         )
-        self._admission_closed = False
+        self._closing_all = False
 
         logger.info(
             "Claude SDK adapter started for agent: %s (model=%s, fallback_model=%s, thinking=%s, effort=%s, approval=%s)",
@@ -857,12 +854,79 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         """
         logger.debug("Handling message %s in room %s", msg.id, room_id)
 
-        if not self._session_manager:
-            raise RuntimeError(
-                "ClaudeSDKAdapter session manager not initialized — was on_started() called?"
-            )
-
+        manager = self._require_admitting(self._session_manager)
         self._admit_turn(room_id, "Claude")
+
+        # Run the turn as a detached task and only await its *release* --
+        # not its completion. A manual approval mid-turn resolves the release
+        # early (see _resolve_manual_approval / _release_turn) so on_message
+        # can return and Band's strictly-sequential per-room message loop can
+        # dispatch the reply that will eventually resolve the approval. When
+        # nothing needs a human, the turn finishes before release fires and
+        # this is equivalent to the previous synchronous await.
+        loop = asyncio.get_running_loop()
+        release_future: asyncio.Future[None] = loop.create_future()
+        self._turn_release[room_id] = release_future
+        # An eager task factory runs the turn before create_task returns.
+        owner_ready: asyncio.Future[TurnTask] = loop.create_future()
+        turn_task = asyncio.create_task(
+            self._run_turn(
+                owner_ready,
+                manager,
+                msg,
+                tools,
+                history,
+                participants_msg,
+                contacts_msg,
+                is_session_bootstrap=is_session_bootstrap,
+                room_id=room_id,
+                release_future=release_future,
+            )
+        )
+        turn_task.add_done_callback(partial(self._forget_turn, room_id))
+        try:
+            try:
+                owner = bind_turn_task(tools, turn_task)
+            except BaseException:
+                owner_ready.cancel()
+                await asyncio.wait({turn_task})
+                raise
+            self._turn_tasks[room_id] = owner
+            if not owner_ready.done():
+                owner_ready.set_result(owner)
+            await asyncio.wait(
+                {release_future, turn_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if turn_task.done():
+                # The turn finished before release fired (the common, no-approval
+                # case) -- await it so a failure still propagates through
+                # on_message exactly as it did before this turn ran detached.
+                await turn_task
+        except asyncio.CancelledError:
+            await self._cancel_turn(room_id)
+            raise
+        finally:
+            if self._turn_release.get(room_id) is release_future:
+                del self._turn_release[room_id]
+
+    def _forget_turn(self, room_id: str, task: asyncio.Task[None]) -> None:
+        owner = self._turn_tasks.get(room_id)
+        if owner is not None and owner.task is task:
+            del self._turn_tasks[room_id]
+
+    async def _prepare_turn(
+        self,
+        manager: ClaudeSessionManager,
+        msg: PlatformMessage,
+        tools: AgentToolsProtocol,
+        history: ClaudeSDKSessionState,
+        participants_msg: str | None,
+        contacts_msg: str | None,
+        *,
+        is_session_bootstrap: bool,
+        room_id: str,
+    ) -> tuple[ClaudeSDKClient, str]:
+        """Open the owned session and format the room's next prompt."""
         if self.config.approvals is not None:
             self._room_last_sender[room_id] = {
                 "id": msg.sender_id,
@@ -871,7 +935,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
 
         # Refused before it rebinds the room's tools: a turn arriving during
         # (or after a failed) teardown must not retarget a retained server.
-        manager = self._require_admitting(self._session_manager)
+        self._require_admitting(manager)
         # The running turn's approvals and MCP calls keep their original tools.
         self._room_tools[room_id] = tools
         await self._bind_mcp_tools(room_id, tools)
@@ -910,6 +974,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
                 AgentFailure(_PROVIDER, GENERIC_PROVIDER_FAILURE_MESSAGE)
             )
             raise
+        self._require_admitting(manager)
 
         # Initialize history for this room on first message
         if is_session_bootstrap:
@@ -964,48 +1029,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             is_session_bootstrap,
             len(messages_to_send),
         )
-
-        # Run the turn as a detached task and only await its *release* --
-        # not its completion. A manual approval mid-turn resolves the release
-        # early (see _resolve_manual_approval / _release_turn) so on_message
-        # can return and Band's strictly-sequential per-room message loop can
-        # dispatch the reply that will eventually resolve the approval. When
-        # nothing needs a human, the turn finishes before release fires and
-        # this is equivalent to the previous synchronous await.
-        self._require_running()
-        loop = asyncio.get_running_loop()
-        release_future: asyncio.Future[None] = loop.create_future()
-        self._turn_release[room_id] = release_future
-        # An eager task factory runs the turn before create_task returns.
-        owner_ready: asyncio.Future[TurnTask] = loop.create_future()
-        turn_task = asyncio.create_task(
-            self._run_turn(
-                owner_ready,
-                client,
-                room_id,
-                tools,
-                full_message,
-                msg.id,
-                release_future,
-            )
-        )
-        self._turn_tasks[room_id] = owner = bind_turn_task(tools, turn_task)
-        owner_ready.set_result(owner)
-        try:
-            await asyncio.wait(
-                {release_future, turn_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if turn_task.done():
-                # The turn finished before release fired (the common, no-approval
-                # case) -- await it so a failure still propagates through
-                # on_message exactly as it did before this turn ran detached.
-                await turn_task
-        except asyncio.CancelledError:
-            await self._cancel_turn(room_id)
-            raise
-        finally:
-            if self._turn_release.get(room_id) is release_future:
-                del self._turn_release[room_id]
+        return client, full_message
 
     async def _open_session(
         self, manager: ClaudeSessionManager, room_id: str, resume_session_id: str | None
@@ -1044,26 +1068,38 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
                 resume_session_id,
                 resume_exc,
             )
-        self._require_running()
+        self._require_admitting(manager)
         return await manager.get_or_create_session(room_id, resume_session_id=None)
-
-    def _require_running(self) -> None:
-        if self._closing_all:
-            raise ClaudeSessionManagerStoppedError("Claude adapter is stopping")
 
     async def _run_turn(
         self,
         owner_ready: asyncio.Future[TurnTask],
-        client: ClaudeSDKClient,
-        room_id: str,
+        manager: ClaudeSessionManager,
+        msg: PlatformMessage,
         tools: AgentToolsProtocol,
-        full_message: str,
-        msg_id: str,
+        history: ClaudeSDKSessionState,
+        participants_msg: str | None,
+        contacts_msg: str | None,
+        *,
+        is_session_bootstrap: bool,
+        room_id: str,
         release_future: asyncio.Future[None],
     ) -> None:
         """Run one turn to completion; always releases ``release_future``."""
         owner = await owner_ready
         try:
+            if owner.deadline is not None:
+                raise asyncio.CancelledError
+            client, full_message = await self._prepare_turn(
+                manager,
+                msg,
+                tools,
+                history,
+                participants_msg,
+                contacts_msg,
+                is_session_bootstrap=is_session_bootstrap,
+                room_id=room_id,
+            )
             try:
                 await self._query_within_deadline(
                     owner, client, room_id, tools, full_message
@@ -1097,11 +1133,10 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
                 await self._retire_client(room_id)
                 raise
 
-            except asyncio.CancelledError:
-                await self._retire_client(room_id)
-                raise
-
-            logger.debug("Message %s processed successfully", msg_id)
+            logger.debug("Message %s processed successfully", msg.id)
+        except asyncio.CancelledError:
+            await self._retire_client(room_id)
+            raise
         finally:
             self._release_turn(room_id, release_future)
             if self._turn_tasks.get(room_id) is owner:
@@ -1669,7 +1704,6 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         # Admission closes now, before anything settles: no turn or session
         # startup may begin, or publish, behind this teardown.
         self._closing_all = True
-        self._admission_closed = True
         if self._session_manager is not None:
             self._session_manager.close_admission()
         teardown = self._teardown
@@ -1729,7 +1763,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             raise RuntimeError(
                 "ClaudeSDKAdapter session manager not initialized — was on_started() called?"
             )
-        if manager is not self._session_manager or self._admission_closed:
+        if manager is not self._session_manager or self._closing_all:
             raise ClaudeSessionManagerStoppedError()
         return manager
 
