@@ -134,27 +134,6 @@ class OmpPermissionRequest(BaseModel):
 PermissionResolver = Callable[[OmpPermissionRequest], Awaitable[str | None]]
 
 
-def _permission_arguments(title: str) -> dict[str, JsonValue]:
-    """Project a UI title without exposing a tool's raw argument section."""
-    header, separator, encoded = title.partition("Arguments:")
-    if not separator:
-        return {"message": title}
-    if header.startswith("Allow tool: ") and header.endswith("\n"):
-        tool_name = header.removeprefix("Allow tool: ").removesuffix("\n")
-        if tool_name and tool_name == tool_name.strip() and "\n" not in tool_name:
-            try:
-                arguments = json.loads(encoded)
-                if isinstance(arguments, dict):
-                    return {
-                        "message": header.removesuffix("\n"),
-                        "tool_name": tool_name,
-                        "arguments": redact_tool_call_args(tool_name, arguments),
-                    }
-            except (json.JSONDecodeError, RecursionError, UnicodeError):
-                pass
-    return {"message": f"{header}Arguments: [arguments unavailable]"}
-
-
 class _ThinkingLevels(BaseModel):
     levels: tuple[str, ...]
 
@@ -586,6 +565,49 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 content=[OmpContent(type="text", text=str(error))], is_error=True
             )
 
+    def _project_tool_call(
+        self, tool_name: str, arguments: dict[str, JsonValue]
+    ) -> tuple[str, dict[str, JsonValue]]:
+        # Withheld tools still need privacy protection; this does not advertise
+        # them or change which calls the adapter allows.
+        names = frozenset(
+            item.name
+            for item in iter_tool_definitions(capabilities=frozenset(Capability))
+        )
+        name, normalized = normalize_omp_mcp_device_call(
+            tool_name,
+            arguments,
+            names,
+            kind="execute" if tool_name == "write" else "read",
+        )
+        # Bare Band aliases need the same privacy policy, without relabelling
+        # native events or treating another server's tool as a Band tool.
+        redaction_name = f"band_{name}" if f"band_{name}" in names else name
+        return name, redact_tool_call_args(
+            redaction_name, cast(dict[str, JsonValue], normalized)
+        )
+
+    def _permission_arguments(self, title: str) -> dict[str, JsonValue]:
+        """Project a UI title through the native tool normalization owner."""
+        header, separator, encoded = title.partition("Arguments:")
+        if not separator:
+            return {"message": title}
+        if header.startswith("Allow tool: ") and header.endswith("\n"):
+            tool_name = header.removeprefix("Allow tool: ").removesuffix("\n")
+            if tool_name and tool_name == tool_name.strip() and "\n" not in tool_name:
+                try:
+                    arguments = json.loads(encoded)
+                    if isinstance(arguments, dict):
+                        name, projected = self._project_tool_call(tool_name, arguments)
+                        return {
+                            "message": header.removesuffix("\n"),
+                            "tool_name": name,
+                            "arguments": projected,
+                        }
+                except (json.JSONDecodeError, RecursionError, UnicodeError):
+                    pass
+        return {"message": f"{header}Arguments: [arguments unavailable]"}
+
     async def _permission(
         self,
         request: OmpUIRequest,
@@ -631,7 +653,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 json.dumps(
                     {
                         "name": name,
-                        "args": _permission_arguments(request.title or ""),
+                        "args": self._permission_arguments(request.title or ""),
                         "tool_call_id": call_id,
                     }
                 ),
@@ -678,19 +700,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 if not event.toolCallId or not event.toolName:
                     return
                 args = event.args if isinstance(event.args, dict) else {}
-                names = frozenset(
-                    item.name
-                    for item in iter_tool_definitions(
-                        capabilities=self.features.capabilities | {Capability.CONTACTS}
-                    )
-                )
-                name, normalized = normalize_omp_mcp_device_call(
-                    event.toolName,
-                    args,
-                    names,
-                    kind="execute" if event.toolName == "write" else "read",
-                )
-                arguments = cast(dict[str, JsonValue], normalized)
+                name, arguments = self._project_tool_call(event.toolName, args)
                 turn.calls[event.toolCallId] = (name, arguments)
                 if Emit.TOOL_CALLS in self.features.emit:
                     await send_event_safe(
@@ -698,7 +708,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                         json.dumps(
                             {
                                 "name": name,
-                                "args": redact_tool_call_args(name, arguments),
+                                "args": arguments,
                                 "tool_call_id": event.toolCallId,
                             }
                         ),

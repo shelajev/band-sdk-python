@@ -195,12 +195,30 @@ async def test_repeated_owned_permission_requests_get_distinct_event_ids(
     assert tools.chat == []
 
 
+@pytest.mark.parametrize(
+    ("spelling", "expected_name"),
+    [
+        ("band_send_room_file", "band_send_room_file"),
+        ("mcp__band_send_room_file", "band_send_room_file"),
+        ("device-write", "band_send_room_file"),
+        ("send_room_file", "send_room_file"),
+    ],
+)
 async def test_owned_permission_projection_redacts_structured_file_content(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, spelling: str, expected_name: str
 ) -> None:
     content = "private-file-bytes-4e612b"
     arguments = {"filename": "private.txt", "content": content, "mentions": ["user"]}
-    title = "Allow tool: band_send_room_file\nArguments: " + json.dumps(arguments)
+    if spelling == "device-write":
+        tool_name = "write"
+        wire_arguments = {
+            "path": "xd://mcp__band_send_room_file",
+            "content": json.dumps(arguments),
+        }
+    else:
+        tool_name = spelling
+        wire_arguments = arguments
+    title = f"Allow tool: {tool_name}\nArguments: " + json.dumps(wire_arguments)
     tools, _ = await owned_rpc_turn(monkeypatch, tmp_path, title, "permission-first")
     permission = next(
         json.loads(event["content"])
@@ -209,8 +227,8 @@ async def test_owned_permission_projection_redacts_structured_file_content(
     )
     assert content not in json.dumps(permission)
     projected = permission["args"]
-    assert projected["message"] == "Allow tool: band_send_room_file"
-    assert projected["tool_name"] == "band_send_room_file"
+    assert projected["message"] == f"Allow tool: {tool_name}"
+    assert projected["tool_name"] == expected_name
     assert projected["arguments"]["filename"] == arguments["filename"]
     assert projected["arguments"]["mentions"] == arguments["mentions"]
     assert projected["arguments"]["content"] != content
