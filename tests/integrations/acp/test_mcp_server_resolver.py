@@ -32,6 +32,7 @@ from band.integrations.acp.client_runtime import ACPProcessCloseError
 from band.integrations.acp.client_types import ACPClientSessionState
 from band.integrations.mcp import BandMCPBackendStoppedError
 from band.runtime.tools import BAND_MCP_SERVER_NAME
+from tests.conftest import eager_tasks, requires_eager_tasks
 from tests.integrations.acp.acp_toolkit import (
     DEFAULT_ROOM,
     FakeACPAgent,
@@ -1188,6 +1189,7 @@ async def test_a_setup_requesting_teardown_does_not_wait_on_itself(
     assert reply.thoughts == ["ok"]
 
 
+@requires_eager_tasks
 async def test_a_final_request_after_shutdown_finished_runs_fresh_final_work() -> None:
     """A final request arriving once a restartable shutdown finished, before
     its registration is cleared, still stops the Band server for good: a
@@ -1208,12 +1210,8 @@ async def test_a_final_request_after_shutdown_finished_runs_fresh_final_work() -
         def request_final() -> None:
             # Runs after the shutdown task finished, before its done callback;
             # started eagerly so the request is made right then.
-            factory = loop.get_task_factory()
-            loop.set_task_factory(asyncio.eager_task_factory)
-            try:
+            with eager_tasks():
                 late.append(asyncio.create_task(adapter.cleanup_all(final=True)))
-            finally:
-                loop.set_task_factory(factory)
 
         async def stopping() -> None:
             await stop()
