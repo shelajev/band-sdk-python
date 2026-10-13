@@ -510,3 +510,128 @@ async def test_adversarial_projection_preserves_record_identity(
     assert not tools.turn.complete
     assert tools.chat == []
     assert receipts and all(receipt["returncode"] == 0 for receipt in receipts)
+
+
+@pytest.mark.parametrize("path", ["native", "permission"])
+@pytest.mark.parametrize("order", ["native-first", "permission-first"])
+async def test_final_encode_failure_preserves_record_and_native_effect(
+    monkeypatch, tmp_path: Path, path: str, order: str
+) -> None:
+    arguments = {
+        "path": "visible.txt",
+        "file_path": False,
+        "target": None,
+        "nested": {"secret": "private-envelope-bytes"},
+    }
+    encoded = json.dumps(arguments)
+    target_name = "band_no_reply" if path == "native" else "omp_permission"
+    dumps = json.dumps
+
+    def fail_private_envelope(value, *args, **kwargs):
+        if isinstance(value, dict) and value.get("name") == target_name:
+            projected = value.get("args", {})
+            if path == "permission":
+                projected = projected.get("arguments", {})
+            if isinstance(projected, dict) and "nested" in projected:
+                raise RecursionError("final envelope encoding failed")
+        return dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(json, "dumps", fail_private_envelope)
+    receipts = []
+    tools, _ = await owned_rpc_turn(
+        monkeypatch,
+        tmp_path,
+        "Allow tool: read\nArguments: " + encoded
+        if path == "permission"
+        else "A question",
+        order,
+        native_name="write" if path == "native" else "read",
+        native_arguments={
+            "path": "xd://mcp__band_no_reply",
+            "content": encoded,
+        }
+        if path == "native"
+        else None,
+        native_error=False,
+        inject_band_tools=False,
+        child_receipts=receipts,
+    )
+    calls = [
+        json.loads(event["content"]) for event in events_of_type(tools, "tool_call")
+    ]
+    results = [
+        json.loads(event["content"]) for event in events_of_type(tools, "tool_result")
+    ]
+    target = next(call for call in calls if call["name"] == target_name)
+    assert target["args"] == {
+        "path": "visible.txt",
+        "file_path": False,
+        "target": None,
+        "arguments": "[private payload unavailable]",
+    }
+    assert "private-envelope-bytes" not in dumps(calls)
+    assert {(result["name"], result["tool_call_id"]) for result in results} == {
+        (call["name"], call["tool_call_id"]) for call in calls
+    }
+    native = next(call for call in calls if call["name"] != "omp_permission")
+    assert native["tool_call_id"] == "ui-wire-id"
+    assert tools.turn.complete is (path == "native")
+    assert tools.chat == []
+    assert receipts and all(receipt["returncode"] == 0 for receipt in receipts)
+
+
+@pytest.mark.parametrize("path", ["native", "permission"])
+async def test_decoded_depth_fails_final_encode_without_losing_record(
+    monkeypatch, tmp_path: Path, path: str
+) -> None:
+    # The C decoder/encoder limit depends on the surrounding Python stack.
+    # Sweep its boundary; injected cases above remain the deterministic proof.
+    for depth in range(9950, 10000):
+        encoded = (
+            '{"path":"visible.txt","nested":'
+            + "[" * depth
+            + '"private-depth-bytes"'
+            + "]" * depth
+            + "}"
+        )
+        receipts = []
+        tools, _ = await owned_rpc_turn(
+            monkeypatch,
+            tmp_path,
+            "Allow tool: read\nArguments: " + encoded
+            if path == "permission"
+            else "A question",
+            "native-first",
+            native_name="write" if path == "native" else "read",
+            native_arguments={
+                "path": "xd://mcp__band_no_reply",
+                "content": encoded,
+            }
+            if path == "native"
+            else None,
+            native_error=False,
+            inject_band_tools=False,
+            child_receipts=receipts,
+        )
+        calls = [
+            json.loads(event["content"]) for event in events_of_type(tools, "tool_call")
+        ]
+        target = next(
+            call
+            for call in calls
+            if call["name"]
+            == ("band_no_reply" if path == "native" else "omp_permission")
+        )
+        assert len(events_of_type(tools, "tool_result")) == 2
+        assert tools.turn.complete is (path == "native")
+        assert tools.chat == []
+        assert receipts and all(receipt["returncode"] == 0 for receipt in receipts)
+        if target["args"].get("arguments") == "[private payload unavailable]":
+            assert target["args"] == {
+                "path": "visible.txt",
+                "arguments": "[private payload unavailable]",
+            }
+            assert "private-depth-bytes" not in json.dumps(calls)
+            break
+    else:
+        pytest.fail("No successfully decoded payload reached the encode boundary")

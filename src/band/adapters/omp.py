@@ -614,6 +614,36 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 }
             return native_name, {"arguments": "[private payload unavailable]"}
 
+    @staticmethod
+    def _encode_tool_call(
+        name: str, arguments: dict[str, JsonValue], call_id: str
+    ) -> str:
+        envelope = {"name": name, "args": arguments, "tool_call_id": call_id}
+        try:
+            return json.dumps(envelope)
+        except Exception:  # noqa: BLE001 - final encoding must not discard tool records
+            wrapper = (
+                arguments.get("arguments", {})
+                if name == "omp_permission"
+                else arguments
+            )
+            safe: dict[str, JsonValue] = {"arguments": "[private payload unavailable]"}
+            if isinstance(wrapper, dict):
+                for key in ("path", "file_path", "target"):
+                    if key not in wrapper:
+                        continue
+                    value = wrapper[key]
+                    # Large integers can fail JSON encoding too; keep only
+                    # scalars whose encoding cannot hit its digit limit.
+                    if (
+                        value is None
+                        or isinstance(value, (str, bool, float))
+                        or (isinstance(value, int) and value.bit_length() <= 1024)
+                    ):
+                        safe[key] = value
+            envelope["args"] = safe
+            return json.dumps(envelope)
+
     def _permission_arguments(self, title: str) -> dict[str, JsonValue]:
         """Project a UI title through the native tool normalization owner."""
         header, separator, encoded = title.partition("Arguments:")
@@ -677,12 +707,8 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
             }
             await send_event_safe(
                 tools,
-                json.dumps(
-                    {
-                        "name": name,
-                        "args": self._permission_arguments(request.title or ""),
-                        "tool_call_id": call_id,
-                    }
+                self._encode_tool_call(
+                    name, self._permission_arguments(request.title or ""), call_id
                 ),
                 MessageType.TOOL_CALL,
                 metadata,
@@ -734,13 +760,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 if Emit.TOOL_CALLS in self.features.emit:
                     await send_event_safe(
                         turn.tools,
-                        json.dumps(
-                            {
-                                "name": name,
-                                "args": arguments,
-                                "tool_call_id": event.toolCallId,
-                            }
-                        ),
+                        self._encode_tool_call(name, arguments, event.toolCallId),
                         MessageType.TOOL_CALL,
                     )
             case "tool_execution_end":

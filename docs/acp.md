@@ -230,6 +230,10 @@ text/image tool results.
   retaining its existing failed-tool identity. Unexpected privacy-projection
   exceptions replace the payload with a fixed opaque placeholder without retrying;
   native identity and device wrapper fields remain intact.
+  Final tool-call envelope encoding is protected too. If encoding fails, the
+  record keeps its event name and ID, scalar `path`/`file_path`/`target` fields
+  and an opaque arguments placeholder. Other private or nested fields are
+  discarded; enabled-native turn effects remain unchanged.
 
 ## Server prompt outcomes
 
