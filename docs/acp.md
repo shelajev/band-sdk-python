@@ -212,6 +212,11 @@ text/image tool results.
   Without a resolver, only the exact native `("Approve", "Deny")` select is
   approved. Unsupported interactive forms are cancelled; this is not approval
   for arbitrary UI requests.
+  A denied or cancelled select is narrated only with `Emit.TOOL_CALLS`; approval
+  and unsupported non-select requests stay silent. Permission narration records
+  no turn effect or chat reply. Synthetic call IDs use `band-permission:`;
+  native tool-event IDs use `omp-tool:` in room telemetry, while their RPC wire
+  IDs stay unchanged. Permission metadata retains the original `omp_request_id`.
 
 ## Server prompt outcomes
 

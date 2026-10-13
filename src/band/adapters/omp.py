@@ -592,17 +592,19 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
             if choice is not None and choice in options
             else OmpUIResponse(cancelled=True)
         )
-        # Denied UI requests never execute a tool, so no native execution frame
-        # can narrate them. Approved requests keep their ordinary tool events.
+        # Permission decisions narrate no Band tool effect. Native execution
+        # frames and synthetic requests use disjoint room-event ID namespaces.
         if Emit.TOOL_CALLS in self.features.emit and (
             response.cancelled or response.value == "Deny"
         ):
             name = "omp_permission"
+            call_id = f"band-permission:{uuid4().hex}"
             metadata = {
                 "permission_request": True,
                 "tool_name": name,
-                "tool_call_id": request.id,
+                "tool_call_id": call_id,
                 "omp_session_id": session_id,
+                "omp_request_id": request.id,
                 "auto_allowed": False,
             }
             await send_event_safe(
@@ -610,8 +612,10 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 json.dumps(
                     {
                         "name": name,
-                        "args": {"message": request.title or ""},
-                        "tool_call_id": request.id,
+                        "args": redact_tool_call_args(
+                            name, {"message": request.title or ""}
+                        ),
+                        "tool_call_id": call_id,
                     }
                 ),
                 MessageType.TOOL_CALL,
@@ -623,7 +627,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                     {
                         "name": name,
                         "output": "Permission cancelled",
-                        "tool_call_id": request.id,
+                        "tool_call_id": call_id,
                         "is_error": True,
                     }
                 ),
@@ -678,7 +682,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                             {
                                 "name": name,
                                 "args": redact_tool_call_args(name, arguments),
-                                "tool_call_id": event.toolCallId,
+                                "tool_call_id": f"omp-tool:{event.toolCallId}",
                             }
                         ),
                         MessageType.TOOL_CALL,
@@ -705,7 +709,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                             {
                                 "name": name,
                                 "output": output,
-                                "tool_call_id": event.toolCallId,
+                                "tool_call_id": f"omp-tool:{event.toolCallId}",
                                 "is_error": bool(event.isError),
                             }
                         ),

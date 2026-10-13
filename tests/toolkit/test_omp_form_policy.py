@@ -8,9 +8,14 @@ from functools import partial
 import pytest
 from pydantic import ValidationError
 
-from band.adapters.omp import OmpAdapter, OmpAdapterConfig, OmpPermissionRequest
+from band.adapters.omp import (
+    OmpAdapter,
+    OmpAdapterConfig,
+    OmpPermissionRequest,
+    OmpTurn,
+)
 from band.converters.omp import OmpSessionState
-from band.integrations.ompwire import OmpUIRequest
+from band.integrations.ompwire import OmpEvent, OmpUIRequest
 from band.runtime.tools.types import BandTool
 from band.testing import FakeAgentTools
 from band.testing.fake_tools import events_of_type
@@ -157,3 +162,105 @@ async def test_direct_native_permissions_remain_cancelled(name: str) -> None:
         FakeAgentTools(),
     )
     assert response.cancelled
+
+
+@pytest.mark.parametrize(
+    ("method", "choice", "cancelled", "pairs"),
+    [
+        ("select", "Approve", False, 0),
+        ("select", "Deny", False, 1),
+        ("select", None, True, 1),
+        ("select", "Always", True, 1),
+        ("notify", "Approve", True, 0),
+    ],
+)
+async def test_only_denied_selects_are_narrated_without_turn_effects(
+    method: str, choice: str | None, cancelled: bool, pairs: int
+) -> None:
+    async def resolve(_request: OmpPermissionRequest) -> str | None:
+        return choice
+
+    adapter = OmpAdapter(resolve_permission=resolve)
+    tools = FakeAgentTools()
+    response = await adapter._permission(
+        OmpUIRequest(
+            id="decision",
+            method=method,
+            title="Allow tool: write",
+            options=["Approve", "Deny"],
+        ),
+        "room",
+        "session",
+        tools,
+    )
+    assert response.cancelled is cancelled
+    assert len(events_of_type(tools, "tool_call")) == pairs
+    results = events_of_type(tools, "tool_result")
+    assert len(results) == pairs
+    if pairs:
+        assert results[0]["metadata"]["permission_outcome"] == "cancelled"
+    assert not tools.turn.complete
+    assert tools.chat == []
+
+
+async def test_permission_narration_respects_disabled_tool_events() -> None:
+    adapter = OmpAdapter(
+        emit=(),
+        resolve_permission=partial(deny_probe_allow_completion, probe_decision=None),
+    )
+    tools = FakeAgentTools()
+    denied = await adapter._permission(
+        OmpUIRequest(id="probe", method="select", title=FORM_PROBE_TITLE),
+        "room",
+        "session",
+        tools,
+    )
+    assert denied.cancelled
+    assert events_of_type(tools, "tool_call") == []
+    assert events_of_type(tools, "tool_result") == []
+    assert not tools.turn.complete
+    assert tools.chat == []
+
+
+async def test_permission_ids_are_unique_and_disjoint_from_native_ids() -> None:
+    adapter = OmpAdapter(
+        resolve_permission=partial(deny_probe_allow_completion, probe_decision=None)
+    )
+    tools = FakeAgentTools()
+    request = OmpUIRequest(id="reused-wire-id", method="select", title=FORM_PROBE_TITLE)
+    await adapter._permission(request, "room", "session", tools)
+    first_id = json.loads(events_of_type(tools, "tool_call")[0]["content"])[
+        "tool_call_id"
+    ]
+    turn = OmpTurn(tools)
+    await adapter._emit_event(
+        OmpEvent(
+            type="tool_execution_start",
+            toolCallId=first_id,
+            toolName="read",
+            args={"path": "unrelated.txt"},
+        ),
+        turn,
+    )
+    await adapter._emit_event(
+        OmpEvent(
+            type="tool_execution_end",
+            toolCallId=first_id,
+            toolName="read",
+            isError=True,
+        ),
+        turn,
+    )
+    await adapter._permission(request, "room", "session", tools)
+    call_ids = [
+        json.loads(event["content"])["tool_call_id"]
+        for event in events_of_type(tools, "tool_call")
+    ]
+    result_ids = [
+        json.loads(event["content"])["tool_call_id"]
+        for event in events_of_type(tools, "tool_result")
+    ]
+    assert len(call_ids) == len(set(call_ids)) == 3
+    assert result_ids == call_ids
+    assert not tools.turn.complete
+    assert tools.chat == []
