@@ -92,8 +92,10 @@ reuse the failed client or take another room's claimed directory.
   - Band's server is added separately; the name `band`, in-process `sdk`
     servers, names that aren't plain strings and a `type` that isn't a string
     are refused by name. The servers reach the CLI only as the path of a
-    private file (directory `0700`, file `0600`), never on its command line, and
-    the file stays until the CLI's exit is confirmed and the file is removed.
+    private file, never on its command line. On POSIX, its directory is `0700`
+    and its file is `0600`. On Windows, privacy relies on the user-profile and
+    temp-directory ACLs, not POSIX mode bits. The file stays until the CLI's exit
+    is confirmed and the file is removed.
   - The session is used only after every server, Band's included, reports
     `connected` through the CLI's `mcp_status`; anything else within 30 seconds
     (each status request included) fails the turn. Errors and logs name the

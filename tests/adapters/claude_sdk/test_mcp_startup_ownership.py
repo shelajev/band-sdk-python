@@ -5,6 +5,7 @@ the real SDK client."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import tempfile
 from collections.abc import Mapping
@@ -23,6 +24,7 @@ from band.integrations.claude_sdk.session_manager import (
 from band.runtime.tools import BAND_MCP_SERVER_NAME
 from band.workspaces import RoomWorkspaces
 from tests.adapters.claude_sdk.fakecli import FakeClaude, Hold
+from tests.adapters.claude_sdk.helpers import refuse_mcp_removal
 
 BAND = {BAND_MCP_SERVER_NAME: {"type": "http", "url": "http://127.0.0.1:9/band"}}
 SECRET = "close-5ecret"
@@ -462,20 +464,17 @@ async def test_a_file_that_cannot_be_removed_stays_owned_until_a_retry(
     manager = manager_for(tmp_path, CountingResolver(), claude)
     await manager.get_or_create_session("room-a")
     path = Path(str(claude.sessions[0].options.mcp_servers))
-    path.parent.chmod(0o500)
     try:
-        with pytest.raises(ClaudeMcpStartupError, match="cleanup"):
-            await manager.cleanup_session("room-a")
-        assert path.exists()
-        assert manager.owns_resources()
+        with refuse_mcp_removal(path):
+            with pytest.raises(ClaudeMcpStartupError, match="cleanup"):
+                await manager.cleanup_session("room-a")
+            assert path.exists()
+            assert manager.owns_resources()
 
-        path.parent.chmod(0o700)
         await manager.cleanup_session("room-a")
         assert not path.exists()
         assert not manager.owns_resources()
     finally:
-        if path.parent.exists():
-            path.parent.chmod(0o700)
         await manager.stop()
 
 
@@ -536,16 +535,17 @@ async def test_a_failed_reservation_keeps_what_the_room_still_holds(
     )
     await manager.get_or_create_session("room-a")
     path = Path(str(claude.sessions[0].options.mcp_servers))
+    refused_removal = contextlib.ExitStack()
     try:
         # The room's cleanup fails, leaving its file (or its whole child) held.
         if retained == "file":
-            path.parent.chmod(0o500)
+            refused_removal.enter_context(refuse_mcp_removal(path))
         else:
             claude.refuse_close = True
         with pytest.raises(ClaudeMcpStartupError, match="cleanup"):
             await manager.cleanup_session("room-a", release_workspace=False)
         if retained == "file":
-            path.parent.chmod(0o700)
+            refused_removal.close()
         else:
             claude.refuse_close = False
 
@@ -571,8 +571,7 @@ async def test_a_failed_reservation_keeps_what_the_room_still_holds(
         await manager.get_or_create_session("room-a")
         assert len(claude.sessions) == 2
     finally:
-        if path.parent.exists():
-            path.parent.chmod(0o700)
+        refused_removal.close()
         claude.refuse_close = False
         band.failing = False
         await manager.stop()

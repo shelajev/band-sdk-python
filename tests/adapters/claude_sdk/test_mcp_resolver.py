@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import typing
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +36,11 @@ from band.integrations.claude_sdk.session_manager import (
 from band.runtime.tools import BAND_MCP_SERVER_NAME
 from tests.adapters.claude_sdk.external_mcp import external_mcp
 from tests.adapters.claude_sdk.fakecli import FakeClaude, FakeCLISession, Hold
-from tests.adapters.claude_sdk.helpers import ClaudeRoom, with_approvals
+from tests.adapters.claude_sdk.helpers import (
+    ClaudeRoom,
+    refuse_mcp_removal,
+    with_approvals,
+)
 from tests.baseline.decisions import ModelDecision
 
 OpenRoom = Callable[..., Awaitable[ClaudeRoom]]
@@ -342,8 +346,6 @@ async def test_the_native_launch_carries_a_private_file_path_not_credentials(
 
     [session] = claude.sessions
     path = launch_file(session)
-    assert stat.S_IMODE(os.stat(path.parent).st_mode) == 0o700
-    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     native = SubprocessCLITransport(
         prompt="",
         options=ClaudeAgentOptions(
@@ -357,6 +359,24 @@ async def test_the_native_launch_carries_a_private_file_path_not_credentials(
     await room.leave()
     assert not path.exists()
     assert not path.parent.exists()
+
+
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="POSIX modes do not prove Windows user-profile/temp-directory ACL privacy",
+)
+async def test_the_private_launch_file_has_posix_permissions(
+    claude_room: OpenRoom, claude: FakeClaude
+) -> None:
+    room = await claude_room(resolve_mcp_servers=Resolver({}))
+    claude.script([room.model_reply("Hi.")])
+    await room.send("hi")
+    path = launch_file(claude.sessions[0])
+    try:
+        assert stat.S_IMODE(os.stat(path.parent).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    finally:
+        await room.leave()
 
 
 async def test_a_missing_history_still_falls_back_to_a_fresh_session(
@@ -577,17 +597,6 @@ def private_files() -> set[Path]:
     return set(Path(tempfile.gettempdir()).glob("band-claude-mcp-*/mcp.json"))
 
 
-@contextlib.contextmanager
-def unremovable(path: Path) -> Iterator[None]:
-    """Its private directory refuses removal until the block exits."""
-    path.parent.chmod(0o500)
-    try:
-        yield
-    finally:
-        if path.parent.exists():
-            path.parent.chmod(0o700)
-
-
 async def test_a_file_left_behind_fences_new_connections_until_removed(
     claude_room: OpenRoom, claude: FakeClaude
 ) -> None:
@@ -597,7 +606,7 @@ async def test_a_file_left_behind_fences_new_connections_until_removed(
     claude.script([room.model_reply("A.")], [room.model_reply("B.")])
     await room.send("first")
     first = launch_file(claude.sessions[0])
-    with unremovable(first):
+    with refuse_mcp_removal(first):
         with pytest.raises(ClaudeMcpStartupError, match="cleanup"):
             await room.leave()
         with pytest.raises(InputNotAccepted, match="closing"):
@@ -630,7 +639,7 @@ async def test_a_resume_fallback_does_not_strand_the_failed_attempts_file(
     try:
         await hold.reached.wait()
         attempt = launch_file(claude.sessions[0])
-        with unremovable(attempt):
+        with refuse_mcp_removal(attempt):
             claude.connecting = None
             hold.released.set()
             # The resumed attempt fails; the fresh fallback finds its file
@@ -662,11 +671,12 @@ async def test_a_partly_written_file_stays_owned_until_removed(
     before = private_files()
     written: list[Path] = []
     real_write = McpConfigFile.write
+    removal_failures = contextlib.ExitStack()
 
     def interrupted(self: McpConfigFile, servers: Mapping[str, Any]) -> None:
         self.path.write_text(f'{{"partial": "{GRANT_A}"')
         written.append(self.path)
-        self.directory.chmod(0o500)  # and its removal is refused
+        removal_failures.enter_context(refuse_mcp_removal(self.path))
         raise OSError(f"disk full writing {GRANT_A}")
 
     monkeypatch.setattr(McpConfigFile, "write", interrupted)
@@ -684,9 +694,7 @@ async def test_a_partly_written_file_stays_owned_until_removed(
         assert partial.exists()
         assert room.adapter._session_manager.owns_resources()
     finally:
-        for path in written:
-            if path.parent.exists():
-                path.parent.chmod(0o700)
+        removal_failures.close()
     monkeypatch.setattr(McpConfigFile, "write", real_write)
 
     await room.leave()
