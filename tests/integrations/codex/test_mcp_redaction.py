@@ -68,37 +68,34 @@ async def test_stderr_and_malformed_rpc_log_metadata_without_payloads(
 
 @pytest.mark.parametrize("request_id", [None, 7])
 @pytest.mark.parametrize(
-    ("method", "expected"),
-    [
-        ("item/tool/call", "item/tool/call"),
-        ("$/cancelRequest", "$/cancelRequest"),
-        ("m" * 128, "m" * 128),
-        ("m" * 129, "<unrecognized method>"),
-        ("item/tool/call\n", "<unrecognized method>"),
-        ("méthode", "<unrecognized method>"),
-        ("Bearer " + SECRET, "<unrecognized method>"),
-        ({"token": SECRET}, "<unrecognized method>"),
-        (7, "<unrecognized method>"),
-    ],
+    "method",
+    ["item/tool/call", "FirstServerGrant2026", {"token": SECRET}, 7],
 )
-async def test_full_rpc_queue_logs_only_protocol_method_identifiers(
+async def test_full_rpc_queue_does_not_log_method_or_parameter_contents(
     caplog: pytest.LogCaptureFixture,
     request_id: int | None,
     method: Any,
-    expected: str,
 ) -> None:
     caplog.set_level(logging.WARNING, logger="band.integrations.codex.rpc_base")
-    client = CodexStdioClient(redactor=redactor())
+    private = freeze_mcp_servers(
+        {
+            "private": CodexMcpHttpServer(
+                "http://localhost/mcp", bearer_token="FirstServerGrant2026"
+            )
+        }
+    )
+    client = CodexStdioClient(redactor=private.redactor)
     client._events = asyncio.Queue(maxsize=1)
     await client._dispatch_rpc_message(json.dumps({"method": "occupied"}))
     await client._dispatch_rpc_message(
         json.dumps({"id": request_id, "method": method, "params": {"token": SECRET}})
     )
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
     rendered = caplog.text
     assert SECRET not in rendered
+    assert "FirstServerGrant2026" not in rendered
     assert "token" not in rendered
-    assert expected in rendered
-    if expected == "<unrecognized method>" and isinstance(method, str):
+    if isinstance(method, str):
         assert method not in rendered
 
 

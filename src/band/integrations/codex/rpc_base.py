@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import random
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -17,14 +16,6 @@ from band.integrations.codex.types import CodexRequestMethod
 logger = logging.getLogger(__name__)
 
 JsonRpcId = int | str
-
-_PROTOCOL_METHOD = re.compile(r"[A-Za-z0-9_./$-]{1,128}")
-
-
-def _diagnostic_method(method: Any) -> str:
-    if isinstance(method, str) and _PROTOCOL_METHOD.fullmatch(method):
-        return method
-    return "<unrecognized method>"
 
 
 class CodexJsonRpcError(RuntimeError):
@@ -302,10 +293,7 @@ class BaseJsonRpcClient:
                     )
                 )
             except asyncio.QueueFull:
-                logger.warning(
-                    "Event queue full; dropping server request %s",
-                    _diagnostic_method(method),
-                )
+                logger.warning("Event queue full; dropping server request")
             return
 
         if method:
@@ -320,10 +308,7 @@ class BaseJsonRpcClient:
                     )
                 )
             except asyncio.QueueFull:
-                logger.warning(
-                    "Event queue full; dropping notification %s",
-                    _diagnostic_method(method),
-                )
+                logger.warning("Event queue full; dropping notification")
             return
 
         if msg_id is not None:

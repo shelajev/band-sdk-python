@@ -130,9 +130,9 @@ workspace path and returning `Mapping[str, CodexMcpServer]`. Import
 
 Transport logs omit RPC and process-stderr payload contents. Unrecognized RPC
 frames report only transport, decoded type and character length; stderr reports
-byte length. Queue-full diagnostics retain a method only when it matches the
-bounded protocol identifier grammar `[A-Za-z0-9_./$-]{1,128}`; other methods are
-reported as `<unrecognized method>`. Cleanup failures report only their type.
+byte length. Queue-full diagnostics report only whether a request or notification
+was dropped, never its method or parameter contents: even a protocol-shaped method
+can contain a credential. Cleanup failures report only their type.
 Scoped redaction still covers forwarded RPC errors. Error frames are sanitized
 before routing to a waiting request, so consumption after owned teardown cannot
 expose the released secret scope.
