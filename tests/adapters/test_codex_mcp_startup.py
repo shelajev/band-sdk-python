@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from band.adapters.codex import CodexAdapter, CodexAdapterConfig
 from band.integrations.codex import CodexJsonRpcError
+from band.integrations.codex import mcp as codex_mcp
 from band.integrations.codex.mcp import (
     CodexMcpHttpServer,
     CodexMcpLaunch,
     CodexMcpServer,
     CodexMcpStartupError,
+    CodexMcpStdioServer,
 )
 from band.integrations.codex.types import CodexRequestMethod, CodexSessionState
 from band.testing import FakeAgentTools, reported_failures
@@ -660,6 +664,27 @@ async def test_invalid_resolver_result_refuses_before_construction(
     assert launches == []
     assert adapter._room_clients["a"].client is None
     await adapter.cleanup_all()
+
+
+async def test_windows_secret_stdio_refuses_before_client_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codex_mcp, "os", SimpleNamespace(name="nt", environ=os.environ))
+    secret = "private-stdio-platform-grant"
+
+    async def resolve(_workspace: str) -> Mapping[str, CodexMcpServer]:
+        return {"private": CodexMcpStdioServer("runner", env={"TOKEN": secret})}
+
+    adapter, launches = mcp_adapter(tmp_path, [StatusClient()], resolve)
+    try:
+        with pytest.raises(CodexMcpStartupError) as error:
+            await start(adapter)
+        assert error.value.stage == "unsupported-platform"
+        assert secret not in str(error.value)
+        assert launches == []
+        assert adapter._room_clients["a"].client is None
+    finally:
+        await adapter.cleanup_all()
 
 
 @requires_eager_tasks

@@ -70,6 +70,7 @@ _STARTUP_STAGES = frozenset(
 )
 _VALIDATION_MESSAGES = {
     "unsupported-transport": "unsupported transport (only stdio and streamable HTTP are supported)",
+    "unsupported-platform": "secret-bearing stdio MCP servers require POSIX exec",
     "invalid-name": "invalid server name",
     "duplicate-name": "duplicate server name",
     "reserved-name": "reserved server name",
@@ -85,7 +86,7 @@ _TOML_ESCAPES = {
     "\r": "\\r",
 }
 # Native env_vars forwards same-named values, never aliases (rmcp-client/src/utils.rs).
-# exec preserves native process ownership while removing the consumed secret aliases.
+# POSIX exec preserves native ownership while removing consumed secret aliases.
 _STDIO_ENV_EXEC = (
     "import json,os,sys; "
     "aliases=json.loads(sys.argv[1]); env=os.environ.copy(); "
@@ -415,6 +416,8 @@ class CodexMcpSnapshot:
                 raise CodexMcpStartupError("unsupported-transport")
             match server:
                 case CodexMcpStdioServer():
+                    if server.env and os.name != "posix":
+                        raise CodexMcpStartupError("unsupported-platform")
                     frozen[name] = CodexMcpStdioServer(
                         server.command, server.args, server.env, server.cwd
                     )

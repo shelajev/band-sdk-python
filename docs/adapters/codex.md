@@ -80,10 +80,14 @@ workspace path and returning `Mapping[str, CodexMcpServer]`. Import
 
 - `CodexMcpStdioServer(command, args=(), env={}, cwd=None)` describes a stdio
   server. Arguments and environment values are copied and frozen. Relative
-  commands and arguments are interpreted in the server's `cwd`. Nonempty `env`
-  uses the SDK's Python interpreter to restore generated environment aliases
+  commands and arguments are interpreted in the server's `cwd`. On POSIX, nonempty
+  `env` uses the SDK's Python interpreter to restore generated environment aliases
   before replacing itself with the server process; native protected environment
-  names are refused.
+  names are refused. On Windows, nonempty stdio `env` is refused before client
+  construction with `CodexMcpStartupError.stage == "unsupported-platform"`:
+  `secret-bearing stdio MCP servers require POSIX exec`. Windows stdio without
+  `env` and all HTTP servers remain supported. A Windows owned supervisor is a
+  separate follow-up, not part of this launch contract.
 - `CodexMcpHttpServer(url, bearer_token=None, headers={})` describes streamable
   HTTP. SSE and other descriptor types are refused before constructing a client.
   Names must match `[A-Za-z0-9_-]+`, be unique, and not be the native reserved name

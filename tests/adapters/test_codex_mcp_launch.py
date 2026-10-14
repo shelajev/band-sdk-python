@@ -20,6 +20,7 @@ import pytest
 from pydantic import TypeAdapter
 
 from band.integrations.codex import CodexStdioClient
+from band.integrations.codex import mcp as codex_mcp
 from band.integrations.codex.mcp import (
     CodexMcpHttpServer,
     CodexMcpLaunch,
@@ -62,7 +63,12 @@ def run_stdio_entry(entry: dict[str, Any], launch: CodexMcpLaunch) -> dict[str, 
 
 
 class TestCodexMcpLaunch:
-    def test_caller_mutation_cannot_change_snapshot_or_launch(self) -> None:
+    def test_caller_mutation_cannot_change_snapshot_or_launch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            codex_mcp, "os", SimpleNamespace(name="posix", environ=os.environ)
+        )
         args = ["--mode", "original"]
         env = {"TOKEN": "stdio-original-grant"}
         headers = {"X-Grant": "http-original-grant"}
@@ -341,7 +347,12 @@ class TestCodexMcpLaunch:
         assert entry["startup_readiness"] == "connection"
         assert launch.env is None
 
-    def test_secrets_only_exist_in_the_private_child_environment(self) -> None:
+    def test_secrets_only_exist_in_the_private_child_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            codex_mcp, "os", SimpleNamespace(name="posix", environ=os.environ)
+        )
         bearer = 'bearer-secret-"\\-🦉'
         header = "header-secret-with\nnewline"
         stdio_value = "stdio-secret-value"
@@ -417,6 +428,45 @@ class TestCodexMcpLaunch:
                 pickle.dumps(runtime)
             assert "first-secret" not in repr(caught.value)
 
+    def test_windows_allows_env_free_stdio_and_secret_http(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            codex_mcp, "os", SimpleNamespace(name="nt", environ=os.environ)
+        )
+        probe = (
+            "import json,os,sys; "
+            "print(json.dumps({'argv':sys.argv[1:], 'env_names':list(os.environ)}))"
+        )
+        command = ("codex", "app-server")
+        snapshot = freeze_mcp_servers(
+            {
+                "local": CodexMcpStdioServer(
+                    sys.executable,
+                    args=("-I", "-c", probe, "literal argument"),
+                    cwd=str(tmp_path),
+                ),
+                "remote": CodexMcpHttpServer(
+                    "http://localhost/mcp",
+                    bearer_token="private-http-platform-grant",
+                    headers={"X-Grant": "private-http-header-grant"},
+                ),
+            }
+        )
+        launch = snapshot.launch(command, None)
+        entries = launched_servers(launch, command)
+        assert set(entries) == {"local", "remote"}
+        observed = run_stdio_entry(entries["local"], launch)
+        assert observed["argv"] == ["literal argument"]
+        assert "TOKEN" not in observed["env_names"]
+        assert not any(
+            name.startswith("BAND_CODEX_MCP_") for name in observed["env_names"]
+        )
+
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="secret-bearing stdio alias ownership requires POSIX exec",
+    )
     def test_stdio_env_aliases_deliver_distinct_same_named_grants_to_relative_targets(
         self,
     ) -> None:

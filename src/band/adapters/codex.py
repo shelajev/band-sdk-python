@@ -1834,6 +1834,7 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
                     and primary.stage
                     in {
                         "unsupported-transport",
+                        "unsupported-platform",
                         "invalid-name",
                         "duplicate-name",
                         "reserved-name",
